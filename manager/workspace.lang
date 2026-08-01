@@ -1,0 +1,64 @@
+package manager
+
+import "lib/string" (stringTrim)
+import "lib/sys" (sysExec)
+import "lib/term" (green, red, spinnerStart, spinnerStop)
+
+fun runtimeAdapter(vcs: String) -> String {
+    base = "Codex Agent Manager runtime adapter: this is a persistent managed Codex thread. The terminal UI may detach while the active turn and long-running command sessions continue. If instructions mention a Bash run_in_background option, use a yielded long-running command session and poll it at intervals no longer than 60 seconds. If a dedicated named agent type is unavailable, use a normal subagent with an explicit bounded task. Treat the assigned cwd as the workspace owned by this thread. The manager owns its lifecycle; do not switch, recreate, or delete it."
+    if vcs == "arc" {
+        base ++ " This workspace uses Arc version control exclusively; use arc and trunk terminology. Do not call unavailable host-only workspace primitives; work directly in the assigned cwd."
+    } else {
+        base
+    }
+}
+
+fun validateRuntime(approval: String, sandbox: String, vcs: String) -> Result<String, Nil> {
+    approvalValid = approval == "untrusted" || approval == "on-request" || approval == "never"
+    sandboxValid = sandbox == "read-only" || sandbox == "workspace-write" || sandbox == "danger-full-access"
+    vcsValid = vcs == "arc" || vcs == "none"
+    if !approvalValid {
+        Fail("invalid approval policy: ${approval}")
+    } else if !sandboxValid {
+        Fail("invalid sandbox mode: ${sandbox}")
+    } else if !vcsValid {
+        Fail("unsupported VCS: ${vcs}")
+    } else {
+        Ok(nil)
+    }
+}
+
+fun provisionWorkspace(task: String, options: Options) -> Result<String, String> {
+    if options.workspace == "current" {
+        return Ok(options.cwd)
+    }
+    if options.workspace != "auto" {
+        return Fail("invalid workspace mode: ${options.workspace}")
+    }
+    spinner = spinnerStart("Preparing workspace for " ++ task ++ "...")
+    result = sysExec(options.helper, [
+        "create", "--task", task,
+        "--cwd", options.cwd,
+        "--vcs", options.vcs,
+        "--setup", options.setup
+    ])
+    if result.code != 0 {
+        spinnerStop(spinner, red("Failed to prepare workspace"))
+        message = stringTrim(result.stderr)
+        Fail(if message == "" { "workspace provider failed" } else { message })
+    } else {
+        spinnerStop(spinner, green("Workspace ready"))
+        agentCwd = stringTrim(result.stdout)
+        if agentCwd == "" { Fail("workspace provider returned an empty cwd") } else { Ok(agentCwd) }
+    }
+}
+
+fun releaseWorkspace(cwd: String, helper: String) -> Result<String, Nil> {
+    result = sysExec(helper, ["remove", "--cwd", cwd])
+    if result.code == 0 {
+        Ok(nil)
+    } else {
+        message = stringTrim(result.stderr)
+        Fail(if message == "" { "workspace provider refused removal" } else { message })
+    }
+}

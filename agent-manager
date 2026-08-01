@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+TOOL_DIR=$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+STATE_DIR=${XDG_STATE_HOME:-"$HOME/.local/state"}/agent-manager
+DEFAULT_SERVER_URL=ws://127.0.0.1:14550
+SERVER_URL=${AGENT_MANAGER_SERVER:-$DEFAULT_SERVER_URL}
+PID_FILE="$STATE_DIR/app-server.pid"
+LOG_FILE="$STATE_DIR/app-server.log"
+SERVICE_NAME=agent-manager-app-server.service
+
+detect_vcs() {
+    local path=$PWD
+    while [[ "$path" != / ]]; do
+        if [[ -e "$path/.arcadia.root" || -e "$path/.arc" ]]; then
+            printf 'arc\n'
+            return
+        fi
+        path=$(dirname -- "$path")
+    done
+    printf 'none\n'
+}
+
+server_pid() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(<"$PID_FILE")
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+start_server() {
+    mkdir -p "$STATE_DIR"
+    if funxy "$TOOL_DIR/manager.lang" --server "$SERVER_URL" --cwd "$PWD" doctor >/dev/null 2>&1; then
+        return
+    fi
+    local pid=""
+    if [[ "$SERVER_URL" == "$DEFAULT_SERVER_URL" ]] && systemctl --user cat "$SERVICE_NAME" >/dev/null 2>&1; then
+        systemctl --user start "$SERVICE_NAME"
+    else
+        nohup codex app-server --listen "$SERVER_URL" >"$LOG_FILE" 2>&1 &
+        pid=$!
+        printf '%s\n' "$pid" >"$PID_FILE"
+    fi
+    for _ in {1..40}; do
+        if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+            printf 'Codex App Server exited; see %s\n' "$LOG_FILE" >&2
+            exit 1
+        fi
+        if funxy "$TOOL_DIR/manager.lang" --server "$SERVER_URL" --cwd "$PWD" doctor >/dev/null 2>&1; then
+            return
+        fi
+        sleep 0.1
+    done
+    funxy "$TOOL_DIR/manager.lang" --server "$SERVER_URL" --cwd "$PWD" doctor >&2 || true
+    printf 'Codex App Server did not become ready; see %s\n' "$LOG_FILE" >&2
+    exit 1
+}
+
+case "${1:-}" in
+    login)
+        command -v codex >/dev/null || { printf 'codex is not installed\n' >&2; exit 1; }
+        shift
+        exec codex login "$@"
+        ;;
+    login-status)
+        command -v codex >/dev/null || { printf 'codex is not installed\n' >&2; exit 1; }
+        exec codex login status
+        ;;
+    server-start)
+        start_server
+        if pid=$(server_pid); then
+            printf 'Codex App Server is running (pid %s)\n' "$pid"
+        else
+            printf 'Codex App Server service is running\n'
+        fi
+        exit 0
+        ;;
+    server-stop)
+        if [[ "$SERVER_URL" == "$DEFAULT_SERVER_URL" ]] && systemctl --user cat "$SERVICE_NAME" >/dev/null 2>&1; then
+            systemctl --user stop "$SERVICE_NAME"
+            printf 'Stopped Codex App Server service\n'
+        elif pid=$(server_pid); then
+            kill "$pid"
+            printf 'Stopped Codex App Server (pid %s)\n' "$pid"
+        else
+            printf 'Codex App Server is not running\n'
+        fi
+        exit 0
+        ;;
+    server-log)
+        if [[ "$SERVER_URL" == "$DEFAULT_SERVER_URL" ]] && systemctl --user cat "$SERVICE_NAME" >/dev/null 2>&1; then
+            exec journalctl --user -u "$SERVICE_NAME" -f
+        else
+            mkdir -p "$STATE_DIR"
+            touch "$LOG_FILE"
+            exec tail -f "$LOG_FILE"
+        fi
+        ;;
+    install)
+        install_dir=${XDG_DATA_HOME:-"$HOME/.local/share"}/agent-manager
+        bin_dir=${XDG_BIN_HOME:-"$HOME/.local/bin"}
+        unit_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user
+        command -v funxy >/dev/null || { printf 'funxy is not installed\n' >&2; exit 1; }
+        command -v codex >/dev/null || { printf 'codex is not installed\n' >&2; exit 1; }
+        mkdir -p "$install_dir/manager" "$bin_dir" "$unit_dir"
+        install -m 0644 "$TOOL_DIR/manager.lang" "$install_dir/manager.lang"
+        rm -f "$install_dir"/manager/*.lang
+        for module in "$TOOL_DIR"/manager/*.lang; do
+            install -m 0644 "$module" "$install_dir/manager/$(basename -- "$module")"
+        done
+        install -m 0755 "$TOOL_DIR/agent-manager" "$install_dir/agent-manager"
+        install -m 0755 "$TOOL_DIR/workspace.sh" "$install_dir/workspace.sh"
+        install -m 0644 "$TOOL_DIR/agent-manager-app-server.service" "$install_dir/agent-manager-app-server.service"
+        install -m 0644 "$install_dir/agent-manager-app-server.service" "$unit_dir/$SERVICE_NAME"
+        ln -sfn "$install_dir/agent-manager" "$bin_dir/agent-manager"
+        if systemctl --user daemon-reload >/dev/null 2>&1 && systemctl --user enable --now "$SERVICE_NAME"; then
+            printf 'Enabled %s\n' "$SERVICE_NAME"
+        else
+            printf 'User systemd is unavailable; the launcher will use a nohup fallback\n' >&2
+        fi
+        printf 'Installed %s/agent-manager\n' "$bin_dir"
+        exit 0
+        ;;
+esac
+
+command -v funxy >/dev/null || { printf 'funxy is not installed\n' >&2; exit 1; }
+command -v codex >/dev/null || { printf 'codex is not installed\n' >&2; exit 1; }
+start_server
+
+manager_flags=(--workspace-helper "$TOOL_DIR/workspace.sh")
+manager_args=()
+while (($#)); do
+    case "$1" in
+        --skill|--prompt|--model|--vcs|--approval|--sandbox|--workspace|--setup)
+            if (($# < 2)); then
+                printf '%s requires a value\n' "$1" >&2
+                exit 2
+            fi
+            manager_flags+=("$1" "$2")
+            shift 2
+            ;;
+        --skill=*|--prompt=*|--model=*|--vcs=*|--approval=*|--sandbox=*|--workspace=*|--setup=*)
+            manager_flags+=("$1")
+            shift
+            ;;
+        *)
+            manager_args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+exec funxy "$TOOL_DIR/manager.lang" --server "$SERVER_URL" --cwd "$PWD" --vcs "$(detect_vcs)" "${manager_flags[@]}" "${manager_args[@]}"

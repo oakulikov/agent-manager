@@ -1,0 +1,124 @@
+package manager
+
+import "lib/json" (Json, jsonEncode, jsonGet, jsonParse)
+import "lib/list" (filter, find, last)
+import "lib/string" (stringEndsWith, stringStartsWith)
+import "lib/ws" (wsClose, wsConnect, wsRecv, wsSend)
+
+fun rpc<p>(conn: Int, id: Int, method: String, params: p) -> Result<String, Json> {
+    wsSend(conn, jsonEncode({ id: id, method: method, params: params }))?
+    awaitResponse(conn, id)
+}
+
+fun awaitResponse(conn: Int, expectedId: Int) -> Result<String, Json> {
+    while true {
+        raw = wsRecv(conn)?
+        parsed = match jsonParse(raw) {
+            Ok(message) -> message
+            Fail(_) -> JNull
+        }
+        match jsonGet(parsed, "id") {
+            Some(JNum(responseId)) -> {
+                if responseId == expectedId {
+                    match jsonGet(parsed, "error") {
+                        Some(error) -> { return Fail(renderJson(error)) }
+                        None -> {
+                            match jsonGet(parsed, "result") {
+                                Some(responseResult) -> { return Ok(responseResult) }
+                                None -> { return Ok(JNull) }
+                            }
+                        }
+                    }
+                }
+            }
+            _ -> nil
+        }
+    }
+}
+
+fun connect(server: String) -> Result<String, Int> {
+    match wsConnect(server) {
+        Fail(e) -> Fail("cannot connect to ${server}: ${e}")
+        Ok(conn) -> {
+            match rpc(conn, 1, "initialize", {
+                clientInfo: { name: "agent-manager", title: "Funxy Agent Manager", version: version },
+                capabilities: { experimentalApi: true }
+            }) {
+                Fail(e) -> {
+                    wsClose(conn)
+                    Fail("initialize failed: ${e}")
+                }
+                Ok(_) -> {
+                    wsSend(conn, jsonEncode({ method: "initialized" }))
+                    Ok(conn)
+                }
+            }
+        }
+    }
+}
+
+fun threadName(thread: Json) -> String {
+    match jsonGet(thread, "name") {
+        Some(JStr(name)) -> name
+        _ -> fieldString(thread, "preview", "unnamed")
+    }
+}
+
+fun threadStatus(thread: Json) -> String {
+    fieldString(fieldObject(thread, "status"), "type", "unknown")
+}
+
+fun listThreads(conn: Int) -> Result<String, List<Json>> {
+    result = rpc(conn, 10, "thread/list", {
+        limit: 100,
+        sortKey: "updated_at",
+        sortDirection: "desc",
+        sourceKinds: ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"]
+    })?
+    match jsonGet(result, "data") {
+        Some(JArr(threads)) -> Ok(filter(fun(thread) -> stringStartsWith(threadName(thread), prefix), threads))
+        _ -> Fail("thread/list returned no data")
+    }
+}
+
+fun printThreads(threads: List<Json>) {
+    if len(threads) == 0 {
+        print("No managed agents")
+        return
+    }
+    print("STATUS\tAGENT\tTHREAD")
+    for thread in threads {
+        print(threadStatus(thread) ++ "\t" ++ threadName(thread) ++ "\t" ++ fieldString(thread, "id", "?"))
+    }
+}
+
+fun findThread(conn: Int, target: String) -> Result<String, Json> {
+    threads = listThreads(conn)?
+    match find(fun(thread) -> {
+        candidateId = fieldString(thread, "id", "")
+        name = threadName(thread)
+        candidateId == target || name == target || (stringStartsWith(name, prefix) && stringEndsWith(name, ":" ++ target))
+    }, threads) {
+        Some(thread) -> Ok(thread)
+        None -> Fail("agent not found: ${target}")
+    }
+}
+
+fun threadIdFromStart(result: Json) -> Result<String, String> {
+    thread = fieldObject(result, "thread")
+    startedThreadId = fieldString(thread, "id", "")
+    if startedThreadId == "" { Fail("thread/start returned no thread id") } else { Ok(startedThreadId) }
+}
+
+fun lastTurnId(thread: Json) -> String {
+    match jsonGet(thread, "turns") {
+        Some(JArr(turns)) -> {
+            if len(turns) == 0 { "" } else { fieldString(last(turns), "id", "") }
+        }
+        _ -> ""
+    }
+}
+
+fun resumeThread(conn: Int, threadId: String, cwd: String) -> Result<String, Json> {
+    rpc(conn, 20, "thread/resume", { threadId: threadId, cwd: cwd })
+}

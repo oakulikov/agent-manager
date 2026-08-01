@@ -1,0 +1,89 @@
+package manager
+
+import "lib/list" (drop)
+import "lib/string" (stringJoin)
+import "lib/ws" (wsClose)
+
+fun selfTest(conn: Int, cwd: String) -> Result<String, Nil> {
+    started = rpc(conn, 80, "thread/start", {
+        cwd: cwd,
+        approvalPolicy: "never",
+        sandbox: "workspace-write",
+        serviceName: "agent-manager-self-test",
+        threadSource: "appServer",
+        ephemeral: false,
+        developerInstructions: "Agent Manager protocol self-test"
+    })?
+    threadId = threadIdFromStart(started)?
+    rpc(conn, 81, "thread/name/set", { threadId: threadId, name: prefix ++ "self-test" })?
+    rpc(conn, 82, "thread/goal/set", {
+        threadId: threadId,
+        objective: "Validate Agent Manager protocol",
+        status: "paused"
+    })?
+    rpc(conn, 83, "thread/goal/get", { threadId: threadId })?
+    rpc(conn, 84, "thread/delete", { threadId: threadId })?
+    print("OK: initialize, thread/start, thread/name/set, thread/goal/set|get, thread/delete")
+    Ok(nil)
+}
+
+fun usage() {
+    print("Funxy Agent Manager ${version}")
+    print("Usage: agent-manager <command> [args]")
+    print("")
+    print("  start NAME [--prompt TEXT] [--skill SKILL] [--model MODEL]")
+    print("             [--sandbox MODE] [--approval POLICY] [--workspace MODE] [--setup MODE]")
+    print("  list")
+    print("  show NAME|THREAD")
+    print("  send NAME|THREAD MESSAGE")
+    print("  stop NAME|THREAD")
+    print("  resume NAME|THREAD")
+    print("  remove NAME|THREAD")
+    print("  watch NAME|THREAD")
+    print("  ui")
+    print("  doctor")
+    print("  self-test")
+}
+
+fun dispatch(conn: Int, command: String, args: List<String>, options: Options) -> Result<String, Nil> {
+    if command == "doctor" {
+        print("OK: Funxy ${version} connected")
+        Ok(nil)
+    } else if command == "self-test" {
+        selfTest(conn, options.cwd)
+    } else if command == "list" {
+        match listThreads(conn) {
+            Ok(threads) -> {
+                printThreads(threads)
+                Ok(nil)
+            }
+            Fail(e) -> Fail(e)
+        }
+    } else if command == "start" && len(args) >= 2 {
+        startAgent(conn, args[1], options)
+    } else if command == "show" && len(args) >= 2 {
+        showAgent(conn, args[1], options.cwd)
+    } else if command == "send" && len(args) >= 3 {
+        sendMessage(conn, args[1], options.cwd, stringJoin(drop(args, 2), " "))
+    } else if command == "stop" && len(args) >= 2 {
+        stopAgent(conn, args[1], options.cwd)
+    } else if command == "resume" && len(args) >= 2 {
+        resumeAgent(conn, args[1], options.cwd)
+    } else if command == "remove" && len(args) >= 2 {
+        removeAgent(conn, args[1], options.helper)
+    } else if command == "watch" && len(args) >= 2 {
+        watchAgent(conn, args[1], options.cwd)
+    } else if command == "ui" {
+        tui(conn, options)
+    } else {
+        usage()
+        Fail("invalid command or arguments")
+    }
+}
+
+fun runManager(server: String, command: String, args: List<String>, options: Options) -> Result<String, Nil> {
+    conn = connect(server)?
+    result = dispatch(conn, command, args, options)
+    wsClose(conn)
+    result
+}

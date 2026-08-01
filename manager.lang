@@ -1,0 +1,39 @@
+import "./manager" (Options, runManager, usage)
+import "lib/flag" (*)
+import "lib/list" (drop)
+import "lib/path" (pathJoin)
+import "lib/sys" (sysScriptDir)
+
+flagSet("server", "ws://127.0.0.1:14550", "Codex App Server WebSocket URL")
+flagSet("cwd", ".", "Agent working directory")
+flagSet("skill", "", "Optional skill invoked by start")
+flagSet("prompt", "", "Additional task instructions")
+flagSet("model", "", "Override the Codex model")
+flagSet("vcs", "none", "Workspace VCS: arc or none (normally detected by the launcher)")
+flagSet("approval", "never", "Codex approval policy")
+flagSet("sandbox", "workspace-write", "Codex sandbox mode")
+flagSet("workspace", "auto", "Workspace mode: auto or current")
+flagSet("setup", "auto", "Workspace setup: auto, none, or aisuite-codex")
+flagSet("workspace-helper", pathJoin([sysScriptDir(), "workspace.sh"]), "Workspace provider executable")
+flagParse()
+
+args = drop(flagArgs(), 1)
+if len(args) == 0 {
+    usage()
+} else {
+    match runManager(flagGet("server"), args[0], args, {
+        cwd: flagGet("cwd"),
+        skill: flagGet("skill"),
+        promptText: flagGet("prompt"),
+        model: flagGet("model"),
+        vcs: flagGet("vcs"),
+        approval: flagGet("approval"),
+        sandbox: flagGet("sandbox"),
+        workspace: flagGet("workspace"),
+        setup: flagGet("setup"),
+        helper: flagGet("workspace-helper")
+    }) {
+        Ok(_) -> nil
+        Fail(e) -> panic(e)
+    }
+}

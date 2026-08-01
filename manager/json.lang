@@ -1,0 +1,35 @@
+package manager
+
+import "lib/json" (Json, jsonGet)
+import "lib/list" (map)
+import "lib/string" (stringJoin)
+import "lib/tuple" (fst, snd)
+
+fun renderJson(value: Json) -> String {
+    match value {
+        JNull -> "null"
+        JBool(v) -> show(v)
+        JNum(v) -> show(v)
+        JStr(v) -> v
+        JArr(values) -> "[" ++ stringJoin(map(renderJson, values), ", ") ++ "]"
+        JObj(fields) -> {
+            parts = map(fun(field) -> fst(field) ++ ": " ++ renderJson(snd(field)), fields)
+            "{" ++ stringJoin(parts, ", ") ++ "}"
+        }
+        _ -> "?"
+    }
+}
+
+fun fieldString(value: Json, key: String, fallback: String) -> String {
+    match jsonGet(value, key) {
+        Some(JStr(found)) -> found
+        _ -> fallback
+    }
+}
+
+fun fieldObject(value: Json, key: String) -> Json {
+    match jsonGet(value, key) {
+        Some(found) -> found
+        None -> JNull
+    }
+}

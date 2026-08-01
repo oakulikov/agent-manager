@@ -1,0 +1,21 @@
+package manager (Options, runManager, usage, version)
+
+type alias Options = {
+    cwd: String,
+    skill: String,
+    promptText: String,
+    model: String,
+    vcs: String,
+    approval: String,
+    sandbox: String,
+    workspace: String,
+    setup: String,
+    helper: String
+}
+
+prefix = "agent-manager:"
+version = "0.2.0"
+
+fun managedName(task: String) -> String {
+    prefix ++ task
+}

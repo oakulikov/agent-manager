@@ -1,0 +1,195 @@
+package manager
+
+import "lib/json" (Json)
+import "lib/list" (indexOf, map, nth, range)
+import "lib/string" (stringReplace)
+import "lib/term" (bold, confirm, cursorDown, cursorHide, cursorShow, cursorUp, cyan, dim, green, prompt, readKey, red, select, table, termClear, termClearLine, termIsTTY, termRaw, termRestore, yellow)
+
+actionNames = [
+    "Start agent",
+    "Show agent",
+    "Send message",
+    "Stop agent",
+    "Resume agent",
+    "Watch live events",
+    "Remove agent",
+    "Refresh",
+    "Quit"
+]
+
+actionKeys = ["s", "v", "m", "p", "r", "w", "d", "f", "q"]
+
+fun agentDisplayName(thread: Json) -> String {
+    stringReplace(threadName(thread), prefix, "")
+}
+
+fun styledStatus(status: String) -> String {
+    if status == "active" {
+        green(status)
+    } else if status == "paused" {
+        yellow(status)
+    } else {
+        dim(status)
+    }
+}
+
+fun printDashboard(threads: List<Json>) {
+    print(bold(cyan("Codex Agent Manager")))
+    print(dim("Persistent threads and isolated workspaces"))
+    print("")
+    if len(threads) == 0 {
+        print(yellow("No managed agents"))
+    } else {
+        table(
+            [bold("Agent"), bold("Status"), bold("Workspace")],
+            map(fun(thread) -> [
+                agentDisplayName(thread),
+                styledStatus(threadStatus(thread)),
+                fieldString(thread, "cwd", "?")
+            ], threads)
+        )
+    }
+    print("")
+}
+
+fun chooseAgent(threads: List<Json>) -> Option<String> {
+    if len(threads) == 0 {
+        print(yellow("There are no managed agents."))
+        None
+    } else {
+        Some(select("Agent", map(agentDisplayName, threads)))
+    }
+}
+
+fun pauseUi() {
+    prompt("Press Enter to continue", "")
+    nil
+}
+
+fun finishUiAction(result: Result<String, Nil>) {
+    match result {
+        Ok(_) -> nil
+        Fail(e) -> print(red("Error: " ++ e))
+    }
+    pauseUi()
+}
+
+fun renderActionMenu(selected: Int) {
+    termClearLine()
+    print("Action")
+    for index in range(0, len(actionNames)) {
+        termClearLine()
+        marker = if index == selected { "  > " } else { "    " }
+        print(marker ++ nth(actionNames, index) ++ " (" ++ nth(actionKeys, index) ++ ")")
+    }
+}
+
+fun redrawActionMenu(selected: Int) {
+    cursorUp(len(actionNames) + 1)
+    renderActionMenu(selected)
+}
+
+fun clearActionMenu() {
+    lines = len(actionNames) + 1
+    cursorUp(lines)
+    for index in range(0, lines) {
+        termClearLine()
+        if index < lines - 1 {
+            cursorDown(1)
+        }
+    }
+    cursorUp(lines - 1)
+}
+
+fun readAction(selected: Int) -> String {
+    while true {
+        key = readKey(100)
+        match indexOf(actionKeys, key) {
+            Some(index) -> { return nth(actionNames, index) }
+            None -> {
+                if key == "enter" {
+                    return nth(actionNames, selected)
+                } else if key == "up" {
+                    next = if selected == 0 { len(actionNames) - 1 } else { selected - 1 }
+                    redrawActionMenu(next)
+                    return readAction(next)
+                } else if key == "down" {
+                    next = if selected == len(actionNames) - 1 { 0 } else { selected + 1 }
+                    redrawActionMenu(next)
+                    return readAction(next)
+                }
+            }
+        }
+    }
+}
+
+fun chooseAction() -> String {
+    termRaw()
+    cursorHide()
+    renderActionMenu(0)
+    action = readAction(0)
+    clearActionMenu()
+    termRestore()
+    cursorShow()
+    action
+}
+
+fun tui(conn: Int, options: Options) -> Result<String, Nil> {
+    if !termIsTTY() {
+        return Fail("ui requires an interactive terminal")
+    }
+    while true {
+        termClear()
+        threads = listThreads(conn)?
+        printDashboard(threads)
+        action = chooseAction()
+        if action == "Quit" {
+            return Ok(nil)
+        } else if action == "Refresh" {
+            nil
+        } else if action == "Start agent" {
+            task = prompt("Agent name or task ID", "")
+            if task == "" {
+                print(red("Agent name cannot be empty"))
+                pauseUi()
+            } else {
+                extra = prompt("Additional instructions (optional)", options.promptText)
+                finishUiAction(startAgent(conn, task, { ...options, promptText: extra }))
+            }
+        } else {
+            match chooseAgent(threads) {
+                None -> pauseUi()
+                Some(target) -> {
+                    if action == "Show agent" {
+                        finishUiAction(showAgent(conn, target, options.cwd))
+                    } else if action == "Send message" {
+                        message = prompt("Message", "")
+                        if message == "" {
+                            print(red("Message cannot be empty"))
+                            pauseUi()
+                        } else {
+                            finishUiAction(sendMessage(conn, target, options.cwd, message))
+                        }
+                    } else if action == "Stop agent" {
+                        finishUiAction(stopAgent(conn, target, options.cwd))
+                    } else if action == "Resume agent" {
+                        finishUiAction(resumeAgent(conn, target, options.cwd))
+                    } else if action == "Watch live events" {
+                        match watchAgentInteractive(conn, target, options.cwd) {
+                            Ok(_) -> nil
+                            Fail(e) -> {
+                                print(red("Error: " ++ e))
+                                pauseUi()
+                            }
+                        }
+                    } else if action == "Remove agent" {
+                        if confirm("Remove " ++ target ++ " and its workspace?", false) {
+                            finishUiAction(removeAgent(conn, target, options.helper))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(nil)
+}
