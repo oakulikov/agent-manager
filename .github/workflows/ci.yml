@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace-tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: bash -n agent-manager workspace.sh tests/workspace_test.sh tests/server_test.sh
+      - name: Test lifecycle helpers
+        run: |
+          ./tests/workspace_test.sh
+          ./tests/server_test.sh
+
+  funxy-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Funxy
+        run: |
+          curl --fail --show-error --silent --location \
+            https://raw.githubusercontent.com/funvibe/funxy/main/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Load and type-check the package
+        run: funxy manager.lang >/dev/null

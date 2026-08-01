@@ -4,7 +4,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -lc "exec codex app-server --listen ws://127.0.0.1:14550"
+ExecStart=/bin/bash -lc "exec codex app-server --listen ws://127.0.0.1:14551"
 Restart=on-failure
 RestartSec=2
 

@@ -6,8 +6,8 @@ import "lib/term" (green, red, spinnerStart, spinnerStop)
 
 fun runtimeAdapter(vcs: String) -> String {
     base = "Codex Agent Manager runtime adapter: this is a persistent managed Codex thread. The terminal UI may detach while the active turn and long-running command sessions continue. If instructions mention a Bash run_in_background option, use a yielded long-running command session and poll it at intervals no longer than 60 seconds. If a dedicated named agent type is unavailable, use a normal subagent with an explicit bounded task. Treat the assigned cwd as the workspace owned by this thread. The manager owns its lifecycle; do not switch, recreate, or delete it."
-    if vcs == "arc" {
-        base ++ " This workspace uses Arc version control exclusively; use arc and trunk terminology. Do not call unavailable host-only workspace primitives; work directly in the assigned cwd."
+    if vcs == "git" {
+        base ++ " This workspace is a Git worktree on a dedicated task branch. Work directly in the assigned cwd and preserve its branch; the manager owns worktree creation and removal."
     } else {
         base
     }
@@ -16,7 +16,7 @@ fun runtimeAdapter(vcs: String) -> String {
 fun validateRuntime(approval: String, sandbox: String, vcs: String) -> Result<String, Nil> {
     approvalValid = approval == "untrusted" || approval == "on-request" || approval == "never"
     sandboxValid = sandbox == "read-only" || sandbox == "workspace-write" || sandbox == "danger-full-access"
-    vcsValid = vcs == "arc" || vcs == "none"
+    vcsValid = vcs == "git" || vcs == "none"
     if !approvalValid {
         Fail("invalid approval policy: ${approval}")
     } else if !sandboxValid {
@@ -39,8 +39,7 @@ fun provisionWorkspace(task: String, options: Options) -> Result<String, String>
     result = sysExec(options.helper, [
         "create", "--task", task,
         "--cwd", options.cwd,
-        "--vcs", options.vcs,
-        "--setup", options.setup
+        "--vcs", options.vcs
     ])
     if result.code != 0 {
         spinnerStop(spinner, red("Failed to prepare workspace"))

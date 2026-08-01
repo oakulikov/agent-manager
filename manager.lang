@@ -4,16 +4,15 @@ import "lib/list" (drop)
 import "lib/path" (pathJoin)
 import "lib/sys" (sysScriptDir)
 
-flagSet("server", "ws://127.0.0.1:14550", "Codex App Server WebSocket URL")
+flagSet("server", "ws://127.0.0.1:14551", "Codex App Server WebSocket URL")
 flagSet("cwd", ".", "Agent working directory")
 flagSet("skill", "", "Optional skill invoked by start")
 flagSet("prompt", "", "Additional task instructions")
 flagSet("model", "", "Override the Codex model")
-flagSet("vcs", "none", "Workspace VCS: arc or none (normally detected by the launcher)")
-flagSet("approval", "never", "Codex approval policy")
+flagSet("vcs", "none", "Workspace VCS: git or none (normally detected by the launcher)")
+flagSet("approval", "on-request", "Codex approval policy")
 flagSet("sandbox", "workspace-write", "Codex sandbox mode")
 flagSet("workspace", "auto", "Workspace mode: auto or current")
-flagSet("setup", "auto", "Workspace setup: auto, none, or aisuite-codex")
 flagSet("workspace-helper", pathJoin([sysScriptDir(), "workspace.sh"]), "Workspace provider executable")
 flagParse()
 
@@ -30,7 +29,6 @@ if len(args) == 0 {
         approval: flagGet("approval"),
         sandbox: flagGet("sandbox"),
         workspace: flagGet("workspace"),
-        setup: flagGet("setup"),
         helper: flagGet("workspace-helper")
     }) {
         Ok(_) -> nil

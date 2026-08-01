@@ -7,7 +7,7 @@ import "lib/ws" (wsClose)
 fun selfTest(conn: Int, cwd: String) -> Result<String, Nil> {
     started = rpc(conn, 80, "thread/start", {
         cwd: cwd,
-        approvalPolicy: "never",
+        approvalPolicy: "on-request",
         sandbox: "workspace-write",
         serviceName: "agent-manager-self-test",
         threadSource: "appServer",
@@ -32,7 +32,7 @@ fun usage() {
     print("Usage: agent-manager <command> [args]")
     print("")
     print("  start NAME [--prompt TEXT] [--skill SKILL] [--model MODEL]")
-    print("             [--sandbox MODE] [--approval POLICY] [--workspace MODE] [--setup MODE]")
+    print("             [--sandbox MODE] [--approval POLICY] [--workspace MODE] [--vcs git|none]")
     print("  list")
     print("  show NAME|THREAD")
     print("  send NAME|THREAD MESSAGE")
@@ -43,6 +43,7 @@ fun usage() {
     print("  ui")
     print("  doctor")
     print("  self-test")
+    print("  server-start|server-status|server-stop|server-log")
 }
 
 fun dispatch(conn: Int, command: String, args: List<String>, options: Options) -> Result<String, Nil> {
