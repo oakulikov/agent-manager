@@ -1,5 +1,6 @@
 package manager
 
+import "lib/json" (Json, jsonGet)
 import "lib/list" (drop)
 import "lib/string" (stringJoin)
 import "lib/ws" (wsClose)
@@ -40,10 +41,75 @@ fun usage() {
     print("  resume NAME|THREAD")
     print("  remove NAME|THREAD")
     print("  watch NAME|THREAD")
+    print("  events [CURSOR]")
+    print("  pending")
+    print("  approve TICKET")
+    print("  approve-session TICKET")
+    print("  decline TICKET")
+    print("  cancel TICKET")
+    print("  answer TICKET TEXT|JSON")
+    print("  reconcile [--fix]")
     print("  ui")
     print("  doctor")
     print("  self-test")
     print("  server-start|server-status|server-stop|server-log")
+}
+
+fun getPendingRequests(conn: Int) -> Result<String, List<Json>> {
+    result = rpc(conn, 90, "agentManager/pending", {})?
+    match jsonGet(result, "data") {
+        Some(JArr(items)) -> Ok(items)
+        _ -> Fail("supervisor returned no pending request data")
+    }
+}
+
+fun pendingRequestLabel(item: Json) -> String {
+    request = fieldObject(item, "request")
+    fieldString(item, "ticket", "?") ++ "  [" ++ fieldString(item, "state", "unknown") ++ "]  " ++ fieldString(request, "method", "?")
+}
+
+fun printPendingRequests(conn: Int) -> Result<String, Nil> {
+    items = getPendingRequests(conn)?
+    if len(items) == 0 {
+        print("No pending requests")
+    } else {
+        print("TICKET\tSTATE\tMETHOD\tTHREAD\tCREATED\tEXPIRES\tDETAILS")
+        for item in items {
+            request = fieldObject(item, "request")
+            params = fieldObject(request, "params")
+            detailText = fieldString(params, "reason", fieldString(params, "message", ""))
+            detail = if detailText == "" { renderJson(params) } else { detailText }
+            print(fieldString(item, "ticket", "?") ++ "\t" ++
+                fieldString(item, "state", "unknown") ++ "\t" ++
+                fieldString(request, "method", "?") ++ "\t" ++
+                fieldString(params, "threadId", "-") ++ "\t" ++
+                show(fieldInt(item, "createdAt", 0)) ++ "\t" ++
+                show(fieldInt(item, "expiresAt", 0)) ++ "\t" ++ detail)
+        }
+    }
+    Ok(nil)
+}
+
+fun respondToPending(conn: Int, ticket: String, action: String, answer: String) -> Result<String, Nil> {
+    rpc(conn, 91, "agentManager/respond", {
+        ticket: ticket,
+        action: action,
+        answer: answer
+    })?
+    print(if action == "answer" { "Answered " ++ ticket } else { action ++ "d " ++ ticket })
+    Ok(nil)
+}
+
+fun printEventBatch(conn: Int, cursor: String) -> Result<String, Nil> {
+    result = rpc(conn, 94, "agentManager/events", { cursor: cursor })?
+    print("CURSOR\t" ++ fieldString(result, "cursor", "0"))
+    match jsonGet(result, "data") {
+        Some(JArr(events)) -> {
+            for event in events { print(encodeJsonValue(event)) }
+        }
+        _ -> nil
+    }
+    Ok(nil)
 }
 
 fun dispatch(conn: Int, command: String, args: List<String>, options: Options) -> Result<String, Nil> {
@@ -71,9 +137,25 @@ fun dispatch(conn: Int, command: String, args: List<String>, options: Options) -
     } else if command == "resume" && len(args) >= 2 {
         resumeAgent(conn, args[1], options.cwd)
     } else if command == "remove" && len(args) >= 2 {
-        removeAgent(conn, args[1], options.helper)
+        removeAgent(conn, args[1], options.helper, options.cwd)
     } else if command == "watch" && len(args) >= 2 {
-        watchAgent(conn, args[1], options.cwd)
+        watchAgent(conn, args[1], options.cwd, options.supervisorToken)
+    } else if command == "events" {
+        printEventBatch(conn, if len(args) >= 2 { args[1] } else { "tail" })
+    } else if command == "pending" {
+        printPendingRequests(conn)
+    } else if command == "approve" && len(args) >= 2 {
+        respondToPending(conn, args[1], "approve", "")
+    } else if command == "approve-session" && len(args) >= 2 {
+        respondToPending(conn, args[1], "approve-session", "")
+    } else if command == "decline" && len(args) >= 2 {
+        respondToPending(conn, args[1], "decline", "")
+    } else if command == "cancel" && len(args) >= 2 {
+        respondToPending(conn, args[1], "cancel", "")
+    } else if command == "answer" && len(args) >= 3 {
+        respondToPending(conn, args[1], "answer", stringJoin(drop(args, 2), " "))
+    } else if command == "reconcile" {
+        reconcileAgents(conn, options, len(args) >= 2 && args[1] == "--fix")
     } else if command == "ui" {
         tui(conn, options)
     } else {
@@ -82,8 +164,8 @@ fun dispatch(conn: Int, command: String, args: List<String>, options: Options) -
     }
 }
 
-fun runManager(server: String, command: String, args: List<String>, options: Options) -> Result<String, Nil> {
-    conn = connect(server)?
+fun runManager(server: String, supervisorToken: String, command: String, args: List<String>, options: Options) -> Result<String, Nil> {
+    conn = connect(server, supervisorToken)?
     result = dispatch(conn, command, args, options)
     wsClose(conn)
     result

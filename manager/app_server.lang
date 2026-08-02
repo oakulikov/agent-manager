@@ -2,12 +2,60 @@ package manager
 
 import "lib/json" (Json, jsonEncode, jsonGet, jsonParse)
 import "lib/list" (filter, find, last)
-import "lib/string" (stringEndsWith, stringStartsWith)
+import "lib/string" (stringStartsWith)
 import "lib/ws" (wsClose, wsConnect, wsRecv, wsSend)
 
 fun rpc<p>(conn: Int, id: Int, method: String, params: p) -> Result<String, Json> {
     wsSend(conn, jsonEncode({ id: id, method: method, params: params }))?
     awaitResponse(conn, id)
+}
+
+fun declineServerRequest(conn: Int, requestId: Json, method: String) -> Result<String, Nil> {
+    print("Warning: declining unsupported detached server request: " ++ method)
+    if method == "item/commandExecution/requestApproval" || method == "item/fileChange/requestApproval" {
+        wsSend(conn, encodeJsonValue(JObj([
+            ("id", requestId),
+            ("result", JObj([("decision", JStr("decline"))]))
+        ])))
+    } else if method == "item/tool/requestUserInput" {
+        wsSend(conn, encodeJsonValue(JObj([
+            ("id", requestId),
+            ("result", JObj([("answers", JObj([]))]))
+        ])))
+    } else if method == "mcpServer/elicitation/request" {
+        wsSend(conn, encodeJsonValue(JObj([
+            ("id", requestId),
+            ("result", JObj([("action", JStr("cancel")), ("content", JNull)]))
+        ])))
+    } else if method == "item/permissions/requestApproval" {
+        wsSend(conn, encodeJsonValue(JObj([
+            ("id", requestId),
+            ("result", JObj([("permissions", JObj([]))]))
+        ])))
+    } else {
+        wsSend(conn, encodeJsonValue(JObj([
+            ("id", requestId),
+            ("error", JObj([
+                ("code", JNum(-32000)),
+                ("message", JStr("Agent Manager does not support this server request"))
+            ]))
+        ])))
+    }
+}
+
+fun handleServerRequest(conn: Int, message: Json) -> Result<String, Bool> {
+    method = fieldString(message, "method", "")
+    match jsonGet(message, "id") {
+        Some(requestId) -> {
+            if method == "" {
+                Ok(false)
+            } else {
+                declineServerRequest(conn, requestId, method)?
+                Ok(true)
+            }
+        }
+        None -> Ok(false)
+    }
 }
 
 fun awaitResponse(conn: Int, expectedId: Int) -> Result<String, Json> {
@@ -16,6 +64,9 @@ fun awaitResponse(conn: Int, expectedId: Int) -> Result<String, Json> {
         parsed = match jsonParse(raw) {
             Ok(message) -> message
             Fail(_) -> JNull
+        }
+        if handleServerRequest(conn, parsed)? {
+            continue
         }
         match jsonGet(parsed, "id") {
             Some(JNum(responseId)) -> {
@@ -36,14 +87,22 @@ fun awaitResponse(conn: Int, expectedId: Int) -> Result<String, Json> {
     }
 }
 
-fun connect(server: String) -> Result<String, Int> {
+fun connect(server: String, supervisorToken: String) -> Result<String, Int> {
     match wsConnect(server) {
         Fail(e) -> Fail("cannot connect to ${server}: ${e}")
         Ok(conn) -> {
-            match rpc(conn, 1, "initialize", {
-                clientInfo: { name: "agent-manager", title: "Funxy Agent Manager", version: version },
-                capabilities: { experimentalApi: true }
-            }) {
+            initParams = if supervisorToken == "" {
+                {
+                    clientInfo: { name: "agent-manager", title: "Funxy Agent Manager", version: version },
+                    capabilities: { experimentalApi: true, mcpServerOpenaiFormElicitation: true, agentManagerToken: "" }
+                }
+            } else {
+                {
+                    clientInfo: { name: "agent-manager", title: "Funxy Agent Manager", version: version },
+                    capabilities: { experimentalApi: true, mcpServerOpenaiFormElicitation: true, agentManagerToken: supervisorToken }
+                }
+            }
+            match rpc(conn, 1, "initialize", initParams) {
                 Fail(e) -> {
                     wsClose(conn)
                     Fail("initialize failed: ${e}")
@@ -68,17 +127,31 @@ fun threadStatus(thread: Json) -> String {
     fieldString(fieldObject(thread, "status"), "type", "unknown")
 }
 
-fun listThreads(conn: Int) -> Result<String, List<Json>> {
-    result = rpc(conn, 10, "thread/list", {
+fun listThreadPages(conn: Int, cursor: String, accumulated: List<Json>, requestId: Int) -> Result<String, List<Json>> {
+    result = rpc(conn, requestId, "thread/list", {
         limit: 100,
+        cursor: if cursor == "" { None } else { Some(cursor) },
         sortKey: "updated_at",
         sortDirection: "desc",
         sourceKinds: ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"]
     })?
     match jsonGet(result, "data") {
-        Some(JArr(threads)) -> Ok(filter(fun(thread) -> stringStartsWith(threadName(thread), prefix), threads))
+        Some(JArr(threads)) -> {
+            allThreads = accumulated ++ threads
+            nextCursor = fieldString(result, "nextCursor", "")
+            if nextCursor == "" {
+                Ok(allThreads)
+            } else {
+                listThreadPages(conn, nextCursor, allThreads, requestId + 1)
+            }
+        }
         _ -> Fail("thread/list returned no data")
     }
+}
+
+fun listThreads(conn: Int) -> Result<String, List<Json>> {
+    threads = listThreadPages(conn, "", [], 10)?
+    Ok(filter(fun(thread) -> stringStartsWith(threadName(thread), prefix), threads))
 }
 
 fun printThreads(threads: List<Json>) {
@@ -92,12 +165,13 @@ fun printThreads(threads: List<Json>) {
     }
 }
 
-fun findThread(conn: Int, target: String) -> Result<String, Json> {
+fun findThread(conn: Int, target: String, cwd: String) -> Result<String, Json> {
     threads = listThreads(conn)?
+    scopedTarget = managedName(target, cwd)
     match find(fun(thread) -> {
         candidateId = fieldString(thread, "id", "")
         name = threadName(thread)
-        candidateId == target || name == target || (stringStartsWith(name, prefix) && stringEndsWith(name, ":" ++ target))
+        candidateId == target || name == target || name == scopedTarget || name == prefix ++ target
     }, threads) {
         Some(thread) -> Ok(thread)
         None -> Fail("agent not found: ${target}")

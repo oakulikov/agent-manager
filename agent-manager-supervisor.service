@@ -1,0 +1,13 @@
+[Unit]
+Description=Persistent Codex request supervisor for Funxy Agent Manager
+After=agent-manager-app-server.service
+Requires=agent-manager-app-server.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -lc "exec $HOME/.local/share/agent-manager/agent-manager supervisor-run"
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

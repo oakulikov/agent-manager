@@ -1,9 +1,24 @@
 package manager
 
-import "lib/json" (Json, jsonGet)
+import "lib/json" (Json, jsonDecode, jsonEncode, jsonGet)
 import "lib/list" (map)
 import "lib/string" (stringJoin)
 import "lib/tuple" (fst, snd)
+
+fun encodeJsonValue(value: Json) -> String {
+    match value {
+        JNull -> "null"
+        JBool(v) -> if v { "true" } else { "false" }
+        JNum(v) -> show(v)
+        JStr(v) -> jsonEncode(v)
+        JArr(values) -> "[" ++ stringJoin(map(encodeJsonValue, values), ",") ++ "]"
+        JObj(fields) -> {
+            parts = map(fun(field) -> jsonEncode(fst(field)) ++ ":" ++ encodeJsonValue(snd(field)), fields)
+            "{" ++ stringJoin(parts, ",") ++ "}"
+        }
+        _ -> "null"
+    }
+}
 
 fun renderJson(value: Json) -> String {
     match value {
@@ -31,5 +46,25 @@ fun fieldObject(value: Json, key: String) -> Json {
     match jsonGet(value, key) {
         Some(found) -> found
         None -> JNull
+    }
+}
+
+fun fieldInt(value: Json, key: String, fallback: Int) -> Int {
+    match jsonGet(value, key) {
+        Some(found) -> {
+            decoded: Result<String, Int> = jsonDecode(encodeJsonValue(found))
+            match decoded {
+                Ok(number) -> number
+                Fail(_) -> fallback
+            }
+        }
+        None -> fallback
+    }
+}
+
+fun fieldBool(value: Json, key: String, fallback: Bool) -> Bool {
+    match jsonGet(value, key) {
+        Some(JBool(found)) -> found
+        _ -> fallback
     }
 }

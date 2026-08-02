@@ -1,0 +1,749 @@
+import "lib/crypto" (sha256)
+import "lib/flag" (*)
+import "lib/io" (dirCreate, dirCreateAll, dirList, dirRemoveAll, fileAppend, fileDelete, fileExists, fileRead, fileWrite)
+import "lib/json" (Json, jsonDecode, jsonEncode, jsonFromValue, jsonGet, jsonParse)
+import "lib/list" (drop, filter, map, take)
+import "lib/path" (pathJoin)
+import "lib/string" (stringEndsWith, stringIndexOf, stringJoin, stringSplit, stringStartsWith, stringTrim)
+import "lib/sys" (sysExec, sysExit)
+import "lib/task" (async, await, taskIsDone)
+import "lib/time" (clockNs, sleepMs, timeNow)
+import "lib/tuple" (fst, snd)
+import "lib/ws" (wsClose, wsConnect, wsRecv, wsRecvTimeout, wsSend, wsServe)
+
+flagSet("upstream", "ws://127.0.0.1:14551", "Codex App Server URL")
+flagSet("port", 14552, "Local supervisor WebSocket port")
+flagSet("state", ".agent-manager-supervisor", "Supervisor state directory")
+flagSet("token", "", "Local client capability token")
+flagSet("token-file", "", "Read local client capability token from file")
+flagSet("pending-ttl", 86400, "Seconds before an unanswered request is safely declined; 0 disables expiry")
+flagSet("notify", true, "Show a desktop notification for new and expired requests")
+flagSet("check", false, "Type-check supervisor and exit")
+flagParse()
+
+if flagGet("check") {
+    print("supervisor OK")
+    sysExit(0)
+}
+
+stateDir = flagGet("state")
+supervisorToken = if flagGet("token-file") == "" {
+    flagGet("token")
+} else {
+    match fileRead(flagGet("token-file")) {
+        Ok(value) -> stringTrim(value)
+        Fail(e) -> panic("cannot read supervisor token file: " ++ e)
+    }
+}
+outboxDir = pathJoin([stateDir, "outbox"])
+responseDir = pathJoin([stateDir, "responses"])
+pendingDir = pathJoin([stateDir, "pending"])
+pendingLockDir = pathJoin([stateDir, "pending-locks"])
+clientDir = pathJoin([stateDir, "clients"])
+startLockDir = pathJoin([stateDir, "start-locks"])
+eventLog = pathJoin([stateDir, "events.jsonl"])
+
+for directory in [stateDir, outboxDir, responseDir, pendingDir, pendingLockDir, clientDir, startLockDir] {
+    dirCreateAll(directory)?
+}
+
+type alias StartLeaseRecord = { lease: String, createdAt: Int }
+
+// Connection IDs and in-flight proxy responses are scoped to one upstream
+// WebSocket session. Pending server requests intentionally survive CLI exits.
+for directory in [outboxDir, responseDir, clientDir, pendingLockDir] {
+    for name in dirList(directory)? {
+        match fileDelete(pathJoin([directory, name])) { _ -> nil }
+    }
+}
+
+upstreamEpoch = take(sha256(show(timeNow()) ++ ":" ++ show(clockNs()) ++ ":" ++ flagGet("upstream")), 24)
+fileWrite(pathJoin([stateDir, "upstream-epoch"]), upstreamEpoch ++ "\n")?
+for name in dirList(startLockDir)? {
+    match dirRemoveAll(pathJoin([startLockDir, name])) { _ -> nil }
+}
+
+fun fieldString(value: Json, key: String, fallback: String) -> String {
+    match jsonGet(value, key) {
+        Some(JStr(text)) -> text
+        _ -> fallback
+    }
+}
+
+fun fieldInt(value: Json, key: String, fallback: Int) -> Int {
+    match jsonGet(value, key) {
+        Some(number) -> {
+            decoded: Result<String, Int> = jsonDecode(encodeJsonValue(number))
+            match decoded {
+                Ok(value) -> value
+                Fail(_) -> fallback
+            }
+        }
+        _ -> fallback
+    }
+}
+
+fun fieldBool(value: Json, key: String, fallback: Bool) -> Bool {
+    match jsonGet(value, key) {
+        Some(JBool(value)) -> value
+        _ -> fallback
+    }
+}
+
+fun objectField(value: Json, key: String) -> Json {
+    match jsonGet(value, key) {
+        Some(found) -> found
+        None -> JObj([])
+    }
+}
+
+fun replaceField(value: Json, key: String, replacement: Json) -> Json {
+    match value {
+        JObj(fields) -> JObj(filter(fun(entry) -> entry[0] != key, fields) ++ [(key, replacement)])
+        _ -> value
+    }
+}
+
+fun encodeJsonValue(value: Json) -> String {
+    match value {
+        JNull -> "null"
+        JBool(v) -> if v { "true" } else { "false" }
+        JNum(v) -> show(v)
+        JStr(v) -> jsonEncode(v)
+        JArr(values) -> "[" ++ stringJoin(map(encodeJsonValue, values), ",") ++ "]"
+        JObj(fields) -> {
+            parts = map(fun(field) -> jsonEncode(fst(field)) ++ ":" ++ encodeJsonValue(snd(field)), fields)
+            "{" ++ stringJoin(parts, ",") ++ "}"
+        }
+        _ -> "null"
+    }
+}
+
+fun clientFile(conn: Int) -> String {
+    pathJoin([clientDir, "${conn}.json"])
+}
+
+fun authorizeClient(conn: Int) -> Result<String, Nil> {
+    fileWrite(clientFile(conn), jsonEncode({ conn: conn }))?
+    Ok(nil)
+}
+
+fun clientAuthorized(conn: Int) -> Bool {
+    fileExists(clientFile(conn))
+}
+
+fun initializeToken(message: Json) -> String {
+    params = objectField(message, "params")
+    capabilities = objectField(params, "capabilities")
+    fieldString(capabilities, "agentManagerToken", "")
+}
+
+fun responseId(message: Json) -> Json {
+    match jsonGet(message, "id") {
+        Some(value) -> value
+        None -> JNull
+    }
+}
+
+fun rpcError(id: Json, code: Int, message: String) -> String {
+    encodeJsonValue(JObj([
+        ("id", id),
+        ("error", JObj([("code", jsonFromValue(code)), ("message", JStr(message))]))
+    ]))
+}
+
+fun rpcResult(id: Json, result: Json) -> String {
+    encodeJsonValue(JObj([("id", id), ("result", result)]))
+}
+
+fun enqueue(name: String, payload: String) -> Result<String, Nil> {
+    fileWrite(pathJoin([outboxDir, name ++ ".payload"]), payload)?
+    fileWrite(pathJoin([outboxDir, name ++ ".ready"]), "")?
+    Ok(nil)
+}
+
+fun pendingPayloadPath(ticket: String) -> String {
+    pathJoin([pendingDir, ticket ++ ".payload"])
+}
+
+fun pendingReadyPath(ticket: String) -> String {
+    pathJoin([pendingDir, ticket ++ ".ready"])
+}
+
+fun pendingLockPath(ticket: String) -> String {
+    pathJoin([pendingLockDir, ticket])
+}
+
+fun requestExpiry(request: Json, createdAt: Int) -> Int {
+    params = objectField(request, "params")
+    autoResolutionMs = fieldInt(params, "autoResolutionMs", 0)
+    ttl = flagGet("pending-ttl")
+    if autoResolutionMs > 0 {
+        createdAt + ((autoResolutionMs + 999) / 1000)
+    } else if ttl > 0 {
+        createdAt + ttl
+    } else {
+        0
+    }
+}
+
+fun pendingRecord(ticket: String, request: Json, epoch: String, createdAt: Int, state: String) -> Json {
+    JObj([
+        ("ticket", JStr(ticket)),
+        ("state", JStr(state)),
+        ("upstreamEpoch", JStr(epoch)),
+        ("createdAt", JNum(createdAt)),
+        ("expiresAt", JNum(requestExpiry(request, createdAt))),
+        ("request", request)
+    ])
+}
+
+fun readPending(ticket: String) -> Result<String, Json> {
+    raw = fileRead(pendingPayloadPath(ticket))?
+    parsed = jsonParse(raw)?
+    // Version 0.5 stored the upstream request directly. Retain it as stale:
+    // the transport connection that owned it no longer exists after restart.
+    if fieldString(parsed, "method", "") != "" {
+        Ok(pendingRecord(ticket, parsed, "legacy", timeNow(), "stale"))
+    } else {
+        Ok(parsed)
+    }
+}
+
+fun writePending(ticket: String, record: Json) -> Result<String, Nil> {
+    fileWrite(pendingPayloadPath(ticket), encodeJsonValue(record))?
+    fileWrite(pendingReadyPath(ticket), "")?
+    Ok(nil)
+}
+
+fun removePending(ticket: String) {
+    match fileDelete(pendingPayloadPath(ticket)) { _ -> nil }
+    match fileDelete(pendingReadyPath(ticket)) { _ -> nil }
+}
+
+fun pendingItems() -> Result<String, Json> {
+    names = dirList(pendingDir)?
+    items = [{
+        ticket = take(name, len(name) - 6)
+        readPending(ticket)?
+    } | name <- names, stringEndsWith(name, ".ready")]
+    Ok(JObj([("upstreamEpoch", JStr(upstreamEpoch)), ("data", JArr(items))]))
+}
+
+fun eventBatch(cursorText: String) -> Result<String, Json> {
+    raw = if fileExists(eventLog) { fileRead(eventLog)? } else { "" }
+    lines = filter(fun(line) -> line != "", stringSplit(raw, "\n"))
+    total = len(lines)
+    cursor = if cursorText == "tail" {
+        total
+    } else {
+        decoded: Result<String, Int> = jsonDecode(cursorText)
+        match decoded {
+            Ok(value) -> if value < 0 { 0 } else { value }
+            Fail(_) -> 0
+        }
+    }
+    selected = if cursor >= total { [] } else { drop(lines, cursor) }
+    events = [jsonParse(line)? | line <- selected]
+    Ok(JObj([("cursor", JStr(show(total))), ("data", JArr(events))]))
+}
+
+fun acquireStartLease(key: String) -> Result<String, Json> {
+    lockPath = pathJoin([startLockDir, take(sha256(key), 24)])
+    attempts = 0
+    while attempts < 200 {
+        match dirCreate(lockPath) {
+            Ok(_) -> {
+                lease = take(sha256(key ++ ":" ++ show(clockNs())), 24)
+                fileWrite(pathJoin([lockPath, "owner.json"]), jsonEncode({
+                    lease: lease,
+                    createdAt: timeNow()
+                }))?
+                return Ok(JObj([("lease", JStr(lease))]))
+            }
+            Fail(_) -> {
+                ownerPath = pathJoin([lockPath, "owner.json"])
+                if fileExists(ownerPath) {
+                    match fileRead(ownerPath) {
+                        Ok(raw) -> {
+                            decoded: Result<String, StartLeaseRecord> = jsonDecode(raw)
+                            match decoded {
+                                Ok(owner) -> {
+                                    if timeNow() - owner.createdAt > 600 {
+                                        match dirRemoveAll(lockPath) { _ -> nil }
+                                    }
+                                }
+                                Fail(_) -> nil
+                            }
+                        }
+                        Fail(_) -> nil
+                    }
+                }
+                sleepMs(50)
+            }
+        }
+        attempts = attempts + 1
+    }
+    Fail("timed out waiting for start reservation: " ++ key)
+}
+
+fun releaseStartLease(key: String, lease: String) -> Result<String, Json> {
+    lockPath = pathJoin([startLockDir, take(sha256(key), 24)])
+    ownerPath = pathJoin([lockPath, "owner.json"])
+    if !fileExists(ownerPath) {
+        return Fail("start reservation is missing")
+    }
+    raw = fileRead(ownerPath)?
+    decoded: Result<String, StartLeaseRecord> = jsonDecode(raw)
+    owner = decoded?
+    if owner.lease != lease {
+        return Fail("start reservation owner mismatch")
+    }
+    dirRemoveAll(lockPath)?
+    Ok(JObj([("released", JBool(true))]))
+}
+
+fun answerValue(value: Json) -> Result<String, Json> {
+    match value {
+        JStr(text) -> Ok(JObj([("answers", JArr([JStr(text)]))]))
+        JArr(values) -> {
+            for item in values {
+                match item {
+                    JStr(_) -> nil
+                    _ -> { return Fail("user-input answer arrays may contain only strings") }
+                }
+            }
+            Ok(JObj([("answers", JArr(values))]))
+        }
+        JObj(_) -> {
+            match jsonGet(value, "answers") {
+                Some(JArr(values)) -> answerValue(JArr(values))
+                _ -> Fail("user-input answer objects require an answers array")
+            }
+        }
+        _ -> Fail("user-input answers must be strings or arrays of strings")
+    }
+}
+
+fun normalizeUserAnswers(params: Json, answer: String) -> Result<String, Json> {
+    parsed = jsonParse(answer)
+    match parsed {
+        Ok(JObj(fields)) -> {
+            normalized = [
+                (fst(field), answerValue(snd(field))?)
+                | field <- fields
+            ]
+            Ok(JObj([("answers", JObj(normalized))]))
+        }
+        _ -> {
+            match jsonGet(params, "questions") {
+                Some(JArr(questions)) -> {
+                    if len(questions) != 1 {
+                        Fail("answer all questions with JSON: {\"question-id\":\"answer\"}")
+                    } else {
+                        questionId = fieldString(questions[0], "id", "")
+                        if questionId == "" {
+                            Fail("user-input request has no question id")
+                        } else {
+                            Ok(JObj([("answers", JObj([(questionId, JObj([("answers", JArr([JStr(answer)]))]))]))]))
+                        }
+                    }
+                }
+                _ -> Fail("user-input request has no questions")
+            }
+        }
+    }
+}
+
+fun approvalDecision(action: String) -> String {
+    if action == "approve" {
+        "accept"
+    } else if action == "approve-session" {
+        "acceptForSession"
+    } else if action == "cancel" {
+        "cancel"
+    } else {
+        "decline"
+    }
+}
+
+fun approvalResult(method: String, params: Json, action: String, answer: String) -> Result<String, Json> {
+    approved = action == "approve" || action == "approve-session"
+    if method == "item/commandExecution/requestApproval" || method == "item/fileChange/requestApproval" {
+        if action != "approve" && action != "approve-session" && action != "decline" && action != "cancel" {
+            Fail("use approve, approve-session, decline, or cancel for " ++ method)
+        } else {
+            Ok(JObj([("decision", JStr(approvalDecision(action)))]))
+        }
+    } else if method == "item/permissions/requestApproval" {
+        if action != "approve" && action != "approve-session" && action != "decline" && action != "cancel" {
+            Fail("use approve or decline for permissions requests")
+        } else if approved {
+            match jsonGet(params, "permissions") {
+                Some(permissions) -> Ok(JObj([
+                    ("permissions", permissions),
+                    ("scope", JStr(if action == "approve-session" { "session" } else { "turn" }))
+                ]))
+                None -> Fail("permissions request has no permissions payload")
+            }
+        } else {
+            Ok(JObj([("permissions", JObj([]))]))
+        }
+    } else if method == "item/tool/requestUserInput" {
+        if action == "decline" || action == "cancel" {
+            Ok(JObj([("answers", JObj([]))]))
+        } else if action != "answer" {
+            Fail("use answer, decline, or cancel for user-input requests")
+        } else {
+            normalizeUserAnswers(params, answer)
+        }
+    } else if method == "mcpServer/elicitation/request" {
+        if action != "answer" && action != "approve" && action != "decline" && action != "cancel" {
+            Fail("use answer, approve, decline, or cancel for MCP elicitation requests")
+        } else if action == "answer" {
+            content = jsonParse(answer)?
+            Ok(JObj([("action", JStr("accept")), ("content", content)]))
+        } else if action == "approve" {
+            Ok(JObj([("action", JStr("accept")), ("content", JNull)]))
+        } else {
+            Ok(JObj([("action", JStr(action)), ("content", JNull)]))
+        }
+    } else {
+        Fail("unsupported pending request method: " ++ method)
+    }
+}
+
+fun respondPendingUnlocked(ticket: String, action: String, answer: String) -> Result<String, Json> {
+    if !fileExists(pendingReadyPath(ticket)) {
+        return Fail("pending request not found: " ++ ticket)
+    }
+    record = readPending(ticket)?
+    pendingState = fieldString(record, "state", "stale")
+    epoch = fieldString(record, "upstreamEpoch", "")
+    if pendingState != "active" {
+        return Fail("pending request " ++ ticket ++ " is " ++ pendingState ++ " and cannot be answered")
+    }
+    if epoch != upstreamEpoch {
+        return Fail("pending request " ++ ticket ++ " belongs to a replaced upstream session")
+    }
+    request = objectField(record, "request")
+    method = fieldString(request, "method", "")
+    params = objectField(request, "params")
+    result = approvalResult(method, params, action, answer)?
+    upstreamId = responseId(request)
+    responding = replaceField(
+        replaceField(record, "state", JStr("responding")),
+        "answeredAt",
+        JNum(timeNow())
+    )
+    writePending(ticket, responding)?
+    queued = enqueue(
+        "answer-" ++ ticket ++ "-" ++ show(clockNs()),
+        encodeJsonValue(JObj([("id", upstreamId), ("result", result)]))
+    )
+    match queued {
+        Ok(_) -> Ok(JObj([("ticket", JStr(ticket)), ("action", JStr(action))]))
+        Fail(e) -> {
+            // Keep the ticket retryable when it never reached the outbox.
+            writePending(ticket, record)?
+            Fail(e)
+        }
+    }
+}
+
+fun respondPending(ticket: String, action: String, answer: String) -> Result<String, Json> {
+    lockPath = pendingLockPath(ticket)
+    match dirCreate(lockPath) {
+        Fail(_) -> Fail("pending request is already being answered: " ++ ticket)
+        Ok(_) -> {
+            result = respondPendingUnlocked(ticket, action, answer)
+            match dirRemoveAll(lockPath) { _ -> nil }
+            result
+        }
+    }
+}
+
+fun handleControl(message: Json, method: String) -> Result<String, String> {
+    requestId = responseId(message)
+    params = objectField(message, "params")
+    if method == "agentManager/pending" {
+        match pendingItems() {
+            Ok(result) -> Ok(rpcResult(requestId, result))
+            Fail(e) -> Ok(rpcError(requestId, -32000, e))
+        }
+    } else if method == "agentManager/events" {
+        match eventBatch(fieldString(params, "cursor", "tail")) {
+            Ok(result) -> Ok(rpcResult(requestId, result))
+            Fail(e) -> Ok(rpcError(requestId, -32000, e))
+        }
+    } else if method == "agentManager/startLock" {
+        match acquireStartLease(fieldString(params, "key", "")) {
+            Ok(result) -> Ok(rpcResult(requestId, result))
+            Fail(e) -> Ok(rpcError(requestId, -32000, e))
+        }
+    } else if method == "agentManager/startUnlock" {
+        match releaseStartLease(fieldString(params, "key", ""), fieldString(params, "lease", "")) {
+            Ok(result) -> Ok(rpcResult(requestId, result))
+            Fail(e) -> Ok(rpcError(requestId, -32000, e))
+        }
+    } else if method == "agentManager/respond" {
+        ticket = fieldString(params, "ticket", "")
+        action = fieldString(params, "action", "")
+        answer = fieldString(params, "answer", "")
+        match respondPending(ticket, action, answer) {
+            Ok(result) -> Ok(rpcResult(requestId, result))
+            Fail(e) -> Ok(rpcError(requestId, -32000, e))
+        }
+    } else {
+        Fail("not a supervisor control method")
+    }
+}
+
+fun proxyRequest(conn: Int, message: Json, raw: String) -> String {
+    requestId = responseId(message)
+    method = fieldString(message, "method", "")
+    if method == "initialize" {
+        if supervisorToken == "" || initializeToken(message) != supervisorToken {
+            rpcError(requestId, -32001, "invalid Agent Manager supervisor token")
+        } else {
+            match authorizeClient(conn) {
+                Ok(_) -> {
+                    rpcResult(requestId, JObj([("userAgent", JStr("agent-manager-supervisor"))]))
+                }
+                Fail(e) -> rpcError(requestId, -32000, e)
+            }
+        }
+    } else if !clientAuthorized(conn) {
+        rpcError(requestId, -32001, "client is not initialized")
+    } else if method == "initialized" {
+        jsonEncode({ method: "agentManager/initialized", params: {} })
+    } else if stringStartsWith(method, "agentManager/") {
+        match handleControl(message, method) {
+            Ok(response) -> response
+            Fail(e) -> rpcError(requestId, -32601, e)
+        }
+    } else {
+        proxyId = take(sha256(show(clockNs()) ++ ":" ++ show(conn) ++ ":" ++ raw), 32)
+        forwarded = replaceField(message, "id", JStr(proxyId))
+        match enqueue(proxyId, encodeJsonValue(forwarded)) {
+            Fail(e) -> rpcError(requestId, -32000, e)
+            Ok(_) -> waitForResponse(requestId, proxyId, 0)
+        }
+    }
+}
+
+fun waitForResponse(clientId: Json, proxyId: String, attempts: Int) -> String {
+    responsePath = pathJoin([responseDir, proxyId ++ ".payload"])
+    responseReadyPath = pathJoin([responseDir, proxyId ++ ".ready"])
+    attempt = attempts
+    while attempt < 6000 {
+        if fileExists(responseReadyPath) {
+            raw = match fileRead(responsePath) {
+                Ok(value) -> value
+                Fail(e) -> { return rpcError(clientId, -32000, e) }
+            }
+            match fileDelete(responsePath) { _ -> nil }
+            match fileDelete(responseReadyPath) { _ -> nil }
+            return match jsonParse(raw) {
+                Ok(response) -> encodeJsonValue(replaceField(response, "id", clientId))
+                Fail(e) -> rpcError(clientId, -32000, e)
+            }
+        }
+        sleepMs(50)
+        attempt = attempt + 1
+    }
+    rpcError(clientId, -32002, "supervisor upstream response timeout")
+}
+
+fun handleDownstream(conn: Int, raw: String) -> String {
+    match jsonParse(raw) {
+        Ok(message) -> proxyRequest(conn, message, raw)
+        Fail(e) -> rpcError(JNull, -32700, e)
+    }
+}
+
+fun notifyUser(title: String, message: String) {
+    if !flagGet("notify") {
+        return
+    }
+    uname = sysExec("uname", ["-s"])
+    if uname.code == 0 && stringTrim(uname.stdout) == "Darwin" {
+        script = "display notification " ++ jsonEncode(message) ++ " with title " ++ jsonEncode(title)
+        match sysExec("osascript", ["-e", script]) { _ -> nil }
+    } else {
+        match sysExec("notify-send", [title, message]) { _ -> nil }
+    }
+}
+
+fun persistPending(raw: String) -> Result<String, Nil> {
+    request = jsonParse(raw)?
+    ticket = take(sha256(upstreamEpoch ++ ":" ++ show(clockNs()) ++ ":" ++ raw), 12)
+    createdAt = timeNow()
+    writePending(ticket, pendingRecord(ticket, request, upstreamEpoch, createdAt, "active"))?
+    print("Pending request " ++ ticket)
+    notifyUser("Codex approval required", fieldString(request, "method", "Request") ++ " · " ++ ticket)
+    Ok(nil)
+}
+
+fun markRetainedPendingStale() -> Result<String, Nil> {
+    for name in dirList(pendingDir)? {
+        if stringEndsWith(name, ".ready") {
+            ticket = take(name, len(name) - 6)
+            record = readPending(ticket)?
+            request = objectField(record, "request")
+            stale = replaceField(replaceField(record, "state", JStr("stale")), "upstreamEpoch", JStr(fieldString(record, "upstreamEpoch", "legacy")))
+            // Rewrite legacy payloads and any active entry retained from the
+            // previous process. No response can be valid on the new socket.
+            if fieldString(record, "state", "stale") != "stale" || fieldString(record, "ticket", "") == "" {
+                writePending(ticket, replaceField(stale, "ticket", JStr(ticket)))?
+            } else if fieldString(record, "ticket", "") == "" {
+                writePending(ticket, pendingRecord(ticket, request, "legacy", timeNow(), "stale"))?
+            }
+        }
+    }
+    Ok(nil)
+}
+
+fun sameRequestId(left: Json, right: Json) -> Bool {
+    encodeJsonValue(left) == encodeJsonValue(right)
+}
+
+fun removeResolvedPending(requestId: Json) -> Result<String, Nil> {
+    for name in dirList(pendingDir)? {
+        if stringEndsWith(name, ".ready") {
+            ticket = take(name, len(name) - 6)
+            record = readPending(ticket)?
+            request = objectField(record, "request")
+            if sameRequestId(responseId(request), requestId) {
+                removePending(ticket)
+            }
+        }
+    }
+    Ok(nil)
+}
+
+fun expirePending() -> Result<String, Nil> {
+    now = timeNow()
+    for name in dirList(pendingDir)? {
+        if stringEndsWith(name, ".ready") {
+            ticket = take(name, len(name) - 6)
+            record = readPending(ticket)?
+            expiresAt = fieldInt(record, "expiresAt", 0)
+            if fieldString(record, "state", "stale") == "active" && expiresAt > 0 && now >= expiresAt {
+                match respondPending(ticket, "decline", "") {
+                    Ok(_) -> {
+                        print("Expired pending request " ++ ticket)
+                        notifyUser("Codex request expired", ticket ++ " was safely declined")
+                    }
+                    Fail(e) -> print("Warning: could not expire pending request " ++ ticket ++ ": " ++ e)
+                }
+            }
+        }
+    }
+    Ok(nil)
+}
+
+fun handleUpstream(raw: String) -> Result<String, Nil> {
+    parsed = jsonParse(raw)?
+    method = fieldString(parsed, "method", "")
+    match jsonGet(parsed, "id") {
+        Some(JStr(proxyId)) -> {
+            if method == "" {
+                fileWrite(pathJoin([responseDir, proxyId ++ ".payload"]), raw)?
+                fileWrite(pathJoin([responseDir, proxyId ++ ".ready"]), "")?
+            } else {
+                persistPending(raw)?
+            }
+        }
+        Some(_) -> {
+            if method != "" { persistPending(raw)? }
+        }
+        None -> {
+            if method == "serverRequest/resolved" {
+                params = objectField(parsed, "params")
+                match jsonGet(params, "requestId") {
+                    Some(requestId) -> removeResolvedPending(requestId)?
+                    None -> nil
+                }
+            }
+            fileAppend(eventLog, raw ++ "\n")?
+        }
+    }
+    Ok(nil)
+}
+
+fun flushOutbox(upstream: Int) -> Result<String, Nil> {
+    names = dirList(outboxDir)?
+    for name in names {
+        if stringEndsWith(name, ".ready") {
+            base = take(name, len(name) - 6)
+            payloadPath = pathJoin([outboxDir, base ++ ".payload"])
+            readyPath = pathJoin([outboxDir, name])
+            raw = fileRead(payloadPath)?
+            wsSend(upstream, raw)?
+            fileDelete(payloadPath)?
+            fileDelete(readyPath)?
+        }
+    }
+    Ok(nil)
+}
+
+fun upstreamLoop(upstream: Int) -> Result<String, Nil> {
+    nextExpirySweep = 0
+    while true {
+        flushOutbox(upstream)?
+        if timeNow() >= nextExpirySweep {
+            expirePending()?
+            nextExpirySweep = timeNow() + 1
+        }
+        match wsRecvTimeout(upstream, 50) {
+            Ok(Some(raw)) -> handleUpstream(raw)?
+            Ok(None) -> nil
+            Fail(e) -> {
+                match stringIndexOf(e, "timeout") {
+                    Some(_) -> nil
+                    None -> { return Fail(e) }
+                }
+            }
+        }
+    }
+    Ok(nil)
+}
+
+markRetainedPendingStale()?
+upstream = wsConnect(flagGet("upstream"))?
+wsSend(upstream, jsonEncode({
+    id: "agent-manager-supervisor-init",
+    method: "initialize",
+    params: {
+        clientInfo: { name: "agent-manager-supervisor", title: "Funxy Agent Manager Supervisor", version: "0.6.0" },
+        capabilities: { experimentalApi: true, mcpServerOpenaiFormElicitation: true }
+    }
+}))?
+
+initialized = wsRecv(upstream)?
+match jsonParse(initialized) {
+    Ok(message) -> {
+        match jsonGet(message, "error") {
+            Some(error) -> panic("supervisor initialize failed: " ++ encodeJsonValue(error))
+            None -> nil
+        }
+    }
+    Fail(e) -> panic("invalid supervisor initialize response: " ++ e)
+}
+wsSend(upstream, jsonEncode({ method: "initialized" }))?
+
+pump = async(fun() -> Result<String, Nil> { upstreamLoop(upstream) })
+wsServe(flagGet("port"), handleDownstream)
+print("Agent Manager supervisor listening on port " ++ show(flagGet("port")))
+
+while !taskIsDone(pump) {
+    sleepMs(250)
+}
+
+wsClose(upstream)
+match await(pump) {
+    Ok(Ok(_)) -> nil
+    Ok(Fail(e)) -> panic("supervisor upstream failed: " ++ e)
+    Fail(e) -> panic("supervisor task failed: " ++ e)
+}

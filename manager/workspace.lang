@@ -1,6 +1,8 @@
 package manager
 
-import "lib/string" (stringTrim)
+import "lib/json" (Json)
+import "lib/list" (find)
+import "lib/string" (stringIndexOf, stringSplit, stringTrim)
 import "lib/sys" (sysExec)
 import "lib/term" (green, red, spinnerStart, spinnerStop)
 
@@ -60,4 +62,118 @@ fun releaseWorkspace(cwd: String, helper: String) -> Result<String, Nil> {
         message = stringTrim(result.stderr)
         Fail(if message == "" { "workspace provider refused removal" } else { message })
     }
+}
+
+type alias WorkspaceRecord = {
+    cwd: String,
+    branch: String,
+    repository: String,
+    root: String,
+    task: String
+}
+
+fun listWorkspaceRecords(helper: String) -> Result<String, List<WorkspaceRecord>> {
+    result = sysExec(helper, ["list"])
+    if result.code != 0 {
+        return Fail(if stringTrim(result.stderr) == "" { "workspace inventory failed" } else { stringTrim(result.stderr) })
+    }
+    records = []
+    for line in stringSplit(result.stdout, "\n") {
+        if line != "" {
+            fields = stringSplit(line, "\t")
+            if len(fields) >= 5 {
+                records = records ++ [{
+                    cwd: fields[0],
+                    branch: fields[1],
+                    repository: fields[2],
+                    root: fields[3],
+                    task: fields[4]
+                }]
+            }
+        }
+    }
+    Ok(records)
+}
+
+fun pathLooksManaged(cwd: String) -> Bool {
+    match stringIndexOf(cwd, "/agent-manager/workspaces/") {
+        Some(_) -> true
+        None -> false
+    }
+}
+
+fun reconcileAgents(conn: Int, options: Options, fix: Bool) -> Result<String, Nil> {
+    threads = listThreads(conn)?
+    workspaces = listWorkspaceRecords(options.helper)?
+    issues = 0
+    repaired = 0
+
+    for workspace in workspaces {
+        owner = find(fun(thread) -> fieldString(thread, "cwd", "") == workspace.cwd, threads)
+        directory = sysExec("test", ["-d", workspace.cwd])
+        if directory.code != 0 {
+            issues = issues + 1
+            print("MISSING_WORKTREE\t" ++ workspace.task ++ "\t" ++ workspace.cwd ++ "\t" ++ workspace.branch)
+        } else {
+            match owner {
+                Some(_) -> nil
+                None -> {
+                    issues = issues + 1
+                    print("ORPHAN_WORKSPACE\t" ++ workspace.task ++ "\t" ++ workspace.cwd ++ "\t" ++ workspace.branch)
+                    if fix {
+                        match releaseWorkspace(workspace.cwd, options.helper) {
+                            Ok(_) -> {
+                                repaired = repaired + 1
+                                print("REPAIRED\tremoved safe orphan workspace " ++ workspace.cwd)
+                            }
+                            Fail(e) -> print("PRESERVED\t" ++ e)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for thread in threads {
+        cwd = fieldString(thread, "cwd", "")
+        directory = sysExec("test", ["-d", cwd])
+        if cwd != "" && directory.code != 0 {
+            issues = issues + 1
+            print("ORPHAN_THREAD\t" ++ threadName(thread) ++ "\t" ++ fieldString(thread, "id", "?") ++ "\t" ++ cwd)
+            if fix && threadStatus(thread) != "active" {
+                match rpc(conn, 98, "thread/archive", { threadId: fieldString(thread, "id", "") }) {
+                    Ok(_) -> {
+                        repaired = repaired + 1
+                        print("REPAIRED\tarchived thread with missing workspace " ++ fieldString(thread, "id", "?"))
+                    }
+                    Fail(e) -> print("PRESERVED\tarchive failed: " ++ e)
+                }
+            } else if fix {
+                print("PRESERVED\tactive thread must be stopped before archival")
+            }
+        } else if cwd != "" && pathLooksManaged(cwd) {
+            metadata = find(fun(workspace) -> workspace.cwd == cwd, workspaces)
+            match metadata {
+                Some(_) -> nil
+                None -> {
+                    issues = issues + 1
+                    print("UNTRACKED_MANAGED_CWD\t" ++ threadName(thread) ++ "\t" ++ cwd)
+                }
+            }
+        }
+    }
+
+    audit = sysExec(options.helper, ["audit", "--cwd", options.cwd])
+    auditText = stringTrim(audit.stdout)
+    if auditText != "" {
+        print(auditText)
+        issues = issues + len(stringSplit(auditText, "\n"))
+    }
+    if issues == 0 {
+        print("Reconcile: no inconsistencies")
+    } else {
+        print("Reconcile: " ++ show(issues) ++ " issue(s), " ++ show(repaired) ++ " repaired")
+        if !fix { print("Run `agent-manager reconcile --fix` for guarded automatic repairs.") }
+    }
+    Ok(nil)
 }

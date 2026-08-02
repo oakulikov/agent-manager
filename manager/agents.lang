@@ -3,19 +3,57 @@ package manager
 import "lib/json" (Json, jsonGet, jsonParse)
 import "lib/list" (find)
 import "lib/term" (readKey, termRaw, termRestore)
+import "lib/time" (sleepMs)
 import "lib/ws" (wsRecv, wsRecvTimeout)
 
 fun startAgent(conn: Int, task: String, options: Options) -> Result<String, Nil> {
+    if options.supervisorToken == "" {
+        return startAgentUnlocked(conn, task, options)
+    }
+    reservationKey = repositoryIdentity(options.cwd)
+    locked = rpc(conn, 27, "agentManager/startLock", { key: reservationKey })?
+    lease = fieldString(locked, "lease", "")
+    if lease == "" {
+        return Fail("supervisor returned no start reservation lease")
+    }
+    result = startAgentUnlocked(conn, task, options)
+    unlock = rpc(conn, 28, "agentManager/startUnlock", {
+        key: reservationKey,
+        lease: lease
+    })
+    match result {
+        Fail(e) -> {
+            match unlock {
+                Ok(_) -> nil
+                Fail(unlockError) -> print("Warning: failed to release start reservation: " ++ unlockError)
+            }
+            Fail(e)
+        }
+        Ok(_) -> {
+            match unlock {
+                Ok(_) -> Ok(nil)
+                Fail(e) -> Fail("agent started, but start reservation release failed: " ++ e)
+            }
+        }
+    }
+}
+
+fun startAgentUnlocked(conn: Int, task: String, options: Options) -> Result<String, Nil> {
     validateRuntime(options.approval, options.sandbox, options.vcs)?
-    existing = match findThread(conn, managedName(task)) {
+    existing = match findThread(conn, managedName(task, options.cwd), options.cwd) {
         Ok(thread) -> Some(thread)
         Fail(_) -> None
     }
     ensureAgentMissing(existing)?
+    if options.workspace == "current" {
+        ensureWorkspaceAvailable(conn, options.cwd)?
+    }
     agentCwd = provisionWorkspace(task, options)?
-    ensureWorkspaceAvailable(conn, agentCwd)?
+    if options.workspace != "current" {
+        ensureWorkspaceAvailable(conn, agentCwd)?
+    }
 
-    started = rpc(conn, 30, "thread/start", {
+    started = match rpc(conn, 30, "thread/start", {
         cwd: agentCwd,
         approvalPolicy: options.approval,
         sandbox: options.sandbox,
@@ -23,10 +61,28 @@ fun startAgent(conn: Int, task: String, options: Options) -> Result<String, Nil>
         threadSource: "appServer",
         model: if options.model == "" { None } else { Some(options.model) },
         developerInstructions: runtimeAdapter(options.vcs)
-    })?
-    threadId = threadIdFromStart(started)?
-    name = managedName(task)
-    rpc(conn, 31, "thread/name/set", { threadId: threadId, name: name })?
+    }) {
+        Ok(value) -> value
+        Fail(e) -> {
+            releaseFailedWorkspace(agentCwd, options)
+            return Fail("thread/start failed: " ++ e)
+        }
+    }
+    threadId = match threadIdFromStart(started) {
+        Ok(value) -> value
+        Fail(e) -> {
+            releaseFailedWorkspace(agentCwd, options)
+            return Fail(e)
+        }
+    }
+    name = managedName(task, options.cwd)
+    match rpc(conn, 31, "thread/name/set", { threadId: threadId, name: name }) {
+        Ok(_) -> nil
+        Fail(e) -> {
+            rollbackFailedStart(conn, threadId, agentCwd, options)
+            return Fail("thread/name/set failed: " ++ e)
+        }
+    }
     taskPrompt = if options.promptText == "" { "Complete task ${task} autonomously." } else { options.promptText }
     initialPrompt = if options.skill == "" {
         taskPrompt
@@ -35,22 +91,51 @@ fun startAgent(conn: Int, task: String, options: Options) -> Result<String, Nil>
     } else {
         "$" ++ options.skill ++ " " ++ task ++ "\n\nAdditional instructions: " ++ options.promptText
     }
-    rpc(conn, 32, "thread/goal/set", {
+    match rpc(conn, 32, "thread/goal/set", {
         threadId: threadId,
         objective: initialPrompt,
         status: "active"
-    })?
-    turn = rpc(conn, 33, "turn/start", {
+    }) {
+        Ok(_) -> nil
+        Fail(e) -> {
+            rollbackFailedStart(conn, threadId, agentCwd, options)
+            return Fail("thread/goal/set failed: " ++ e)
+        }
+    }
+    turn = match rpc(conn, 33, "turn/start", {
         threadId: threadId,
         input: [{ type: "text", text: initialPrompt }],
         cwd: agentCwd
-    })?
+    }) {
+        Ok(value) -> value
+        Fail(e) -> {
+            rollbackFailedStart(conn, threadId, agentCwd, options)
+            return Fail("turn/start failed: " ++ e)
+        }
+    }
     print("Started ${name}")
     print("thread: ${threadId}")
     print("cwd:    ${agentCwd}")
     print("turn:   ${fieldString(fieldObject(turn, "turn"), "id", "started")}")
     print("You may disconnect; use `agent-manager watch ${task}` to return.")
     Ok(nil)
+}
+
+fun releaseFailedWorkspace(cwd: String, options: Options) {
+    if options.workspace != "current" {
+        match releaseWorkspace(cwd, options.helper) {
+            Ok(_) -> nil
+            Fail(e) -> print("Warning: failed to roll back workspace: " ++ e)
+        }
+    }
+}
+
+fun rollbackFailedStart(conn: Int, threadId: String, cwd: String, options: Options) {
+    match rpc(conn, 39, "thread/delete", { threadId: threadId }) {
+        Ok(_) -> nil
+        Fail(e) -> print("Warning: failed to roll back thread " ++ threadId ++ ": " ++ e)
+    }
+    releaseFailedWorkspace(cwd, options)
 }
 
 fun ensureAgentMissing(existing: Option<Json>) -> Result<String, Nil> {
@@ -69,7 +154,7 @@ fun ensureWorkspaceAvailable(conn: Int, cwd: String) -> Result<String, Nil> {
 }
 
 fun sendMessage(conn: Int, target: String, fallbackCwd: String, message: String) -> Result<String, Nil> {
-    found = findThread(conn, target)?
+    found = findThread(conn, target, fallbackCwd)?
     threadId = fieldString(found, "id", "")
     agentCwd = fieldString(found, "cwd", fallbackCwd)
     resumed = resumeThread(conn, threadId, agentCwd)?
@@ -96,7 +181,7 @@ fun sendMessage(conn: Int, target: String, fallbackCwd: String, message: String)
 }
 
 fun stopAgent(conn: Int, target: String, fallbackCwd: String) -> Result<String, Nil> {
-    found = findThread(conn, target)?
+    found = findThread(conn, target, fallbackCwd)?
     threadId = fieldString(found, "id", "")
     agentCwd = fieldString(found, "cwd", fallbackCwd)
     resumed = resumeThread(conn, threadId, agentCwd)?
@@ -113,7 +198,7 @@ fun stopAgent(conn: Int, target: String, fallbackCwd: String) -> Result<String, 
 }
 
 fun resumeAgent(conn: Int, target: String, fallbackCwd: String) -> Result<String, Nil> {
-    found = findThread(conn, target)?
+    found = findThread(conn, target, fallbackCwd)?
     threadId = fieldString(found, "id", "")
     agentCwd = fieldString(found, "cwd", fallbackCwd)
     resumed = resumeThread(conn, threadId, agentCwd)?
@@ -130,8 +215,8 @@ fun resumeAgent(conn: Int, target: String, fallbackCwd: String) -> Result<String
     Ok(nil)
 }
 
-fun removeAgent(conn: Int, target: String, helper: String) -> Result<String, Nil> {
-    found = findThread(conn, target)?
+fun removeAgent(conn: Int, target: String, helper: String, fallbackCwd: String) -> Result<String, Nil> {
+    found = findThread(conn, target, fallbackCwd)?
     if threadStatus(found) == "active" {
         return Fail("agent is active; stop it before removing")
     }
@@ -165,7 +250,7 @@ fun terminateBackgroundTerminals(conn: Int, threadId: String) -> Result<String, 
 }
 
 fun showAgent(conn: Int, target: String, fallbackCwd: String) -> Result<String, Nil> {
-    found = findThread(conn, target)?
+    found = findThread(conn, target, fallbackCwd)?
     threadId = fieldString(found, "id", "")
     resumeThread(conn, threadId, fieldString(found, "cwd", fallbackCwd))?
     details = rpc(conn, 70, "thread/read", { threadId: threadId, includeTurns: true })?
@@ -179,25 +264,58 @@ fun showAgent(conn: Int, target: String, fallbackCwd: String) -> Result<String, 
     Ok(nil)
 }
 
-fun watchAgent(conn: Int, target: String, fallbackCwd: String) -> Result<String, Nil> {
-    found = findThread(conn, target)?
+fun watchAgent(conn: Int, target: String, fallbackCwd: String, supervisorToken: String) -> Result<String, Nil> {
+    found = findThread(conn, target, fallbackCwd)?
     threadId = fieldString(found, "id", "")
     resumeThread(conn, threadId, fieldString(found, "cwd", fallbackCwd))?
     print("Watching ${threadName(found)}. Press Ctrl+C to detach.")
-    while true {
-        printWatchEvent(wsRecv(conn)?, threadId)
+    if supervisorToken != "" {
+        initial = rpc(conn, 95, "agentManager/events", { cursor: "tail" })?
+        return watchSupervisorEvents(conn, threadId, fieldString(initial, "cursor", "0"), false)
     }
+    while true {
+        processWatchEvent(conn, wsRecv(conn)?, threadId)?
+    }
+    Ok(nil)
 }
 
-fun watchAgentInteractive(conn: Int, target: String, fallbackCwd: String) -> Result<String, Nil> {
-    found = findThread(conn, target)?
+fun watchAgentInteractive(conn: Int, target: String, fallbackCwd: String, supervisorToken: String) -> Result<String, Nil> {
+    found = findThread(conn, target, fallbackCwd)?
     threadId = fieldString(found, "id", "")
     resumeThread(conn, threadId, fieldString(found, "cwd", fallbackCwd))?
     print("Watching ${threadName(found)}. Press q to return to the dashboard.")
     termRaw()
-    result = watchInteractiveLoop(conn, threadId)
+    result = if supervisorToken == "" {
+        watchInteractiveLoop(conn, threadId)
+    } else {
+        match rpc(conn, 95, "agentManager/events", { cursor: "tail" }) {
+            Ok(initial) -> watchSupervisorEvents(conn, threadId, fieldString(initial, "cursor", "0"), true)
+            Fail(e) -> Fail(e)
+        }
+    }
     termRestore()
     result
+}
+
+fun watchSupervisorEvents(conn: Int, threadId: String, cursor: String, interactive: Bool) -> Result<String, Nil> {
+    nextCursor = cursor
+    while true {
+        if interactive && readKey(0) == "q" {
+            return Ok(nil)
+        }
+        result = rpc(conn, 96, "agentManager/events", { cursor: nextCursor })?
+        match jsonGet(result, "data") {
+            Some(JArr(events)) -> {
+                for event in events {
+                    printWatchEvent(encodeJsonValue(event), threadId)
+                }
+            }
+            _ -> nil
+        }
+        nextCursor = fieldString(result, "cursor", nextCursor)
+        sleepMs(100)
+    }
+    Ok(nil)
 }
 
 fun watchInteractiveLoop(conn: Int, threadId: String) -> Result<String, Nil> {
@@ -206,12 +324,25 @@ fun watchInteractiveLoop(conn: Int, threadId: String) -> Result<String, Nil> {
             return Ok(nil)
         }
         match wsRecvTimeout(conn, 100) {
-            Ok(Some(raw)) -> printWatchEvent(raw, threadId)
+            Ok(Some(raw)) -> processWatchEvent(conn, raw, threadId)?
             Ok(None) -> nil
-            Fail(_) -> nil
+            Fail(e) -> { return Fail(e) }
         }
     }
     Ok(nil)
+}
+
+fun processWatchEvent(conn: Int, raw: String, threadId: String) -> Result<String, Nil> {
+    parsed = match jsonParse(raw) {
+        Ok(message) -> message
+        Fail(_) -> JNull
+    }
+    if handleServerRequest(conn, parsed)? {
+        Ok(nil)
+    } else {
+        printWatchEvent(raw, threadId)
+        Ok(nil)
+    }
 }
 
 fun printWatchEvent(raw: String, threadId: String) {

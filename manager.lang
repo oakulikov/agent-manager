@@ -5,6 +5,7 @@ import "lib/path" (pathJoin)
 import "lib/sys" (sysScriptDir)
 
 flagSet("server", "ws://127.0.0.1:14551", "Codex App Server WebSocket URL")
+flagSet("supervisor-token", "", "Agent Manager supervisor capability token")
 flagSet("cwd", ".", "Agent working directory")
 flagSet("skill", "", "Optional skill invoked by start")
 flagSet("prompt", "", "Additional task instructions")
@@ -20,7 +21,7 @@ args = drop(flagArgs(), 1)
 if len(args) == 0 {
     usage()
 } else {
-    match runManager(flagGet("server"), args[0], args, {
+    match runManager(flagGet("server"), flagGet("supervisor-token"), args[0], args, {
         cwd: flagGet("cwd"),
         skill: flagGet("skill"),
         promptText: flagGet("prompt"),
@@ -29,7 +30,8 @@ if len(args) == 0 {
         approval: flagGet("approval"),
         sandbox: flagGet("sandbox"),
         workspace: flagGet("workspace"),
-        helper: flagGet("workspace-helper")
+        helper: flagGet("workspace-helper"),
+        supervisorToken: flagGet("supervisor-token")
     }) {
         Ok(_) -> nil
         Fail(e) -> panic(e)

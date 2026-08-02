@@ -1,0 +1,13 @@
+import "../manager" (managedName)
+
+first = managedName("same-task", "/tmp/agent-manager-repository-a")
+second = managedName("same-task", "/tmp/agent-manager-repository-b")
+repeat = managedName("same-task", "/tmp/agent-manager-repository-a")
+
+if first == second {
+    panic("repository namespaces collided")
+}
+if first != repeat {
+    panic("repository namespace is not stable")
+}
+print("repository namespace tests passed")

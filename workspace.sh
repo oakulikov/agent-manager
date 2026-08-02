@@ -2,16 +2,49 @@
 set -euo pipefail
 
 STATE_DIR=${XDG_STATE_HOME:-"$HOME/.local/state"}/agent-manager/workspaces
+LOCK_DIR="$STATE_DIR/.workspace-lock"
 
 usage() {
     printf 'Usage:\n' >&2
     printf '  workspace.sh create --task NAME --cwd PATH --vcs git|none\n' >&2
     printf '  workspace.sh remove --cwd PATH\n' >&2
+    printf '  workspace.sh list\n' >&2
+    printf '  workspace.sh audit --cwd PATH\n' >&2
     exit 2
 }
 
 canonical_dir() {
     (cd -- "$1" && pwd -P)
+}
+
+acquire_workspace_lock() {
+    local owner=""
+    mkdir -p -- "$STATE_DIR"
+    for _ in {1..200}; do
+        if mkdir -- "$LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" >"$LOCK_DIR/owner"
+            trap release_workspace_lock EXIT
+            return 0
+        fi
+        if [[ -f "$LOCK_DIR/owner" ]]; then
+            owner=$(<"$LOCK_DIR/owner")
+            if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+                rm -f -- "$LOCK_DIR/owner"
+                rmdir "$LOCK_DIR" 2>/dev/null || true
+                continue
+            fi
+        fi
+        sleep 0.05
+    done
+    printf 'Timed out waiting for workspace state lock: %s\n' "$LOCK_DIR" >&2
+    exit 1
+}
+
+release_workspace_lock() {
+    if [[ -f "$LOCK_DIR/owner" ]] && [[ "$(<"$LOCK_DIR/owner")" == "$$" ]]; then
+        rm -f -- "$LOCK_DIR/owner"
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
 }
 
 digest() {
@@ -133,6 +166,8 @@ create_workspace() {
         return
     fi
 
+    acquire_workspace_lock
+
     local source_root
     source_root=$(git -C "$source_cwd" rev-parse --show-toplevel 2>/dev/null) || {
         printf '%s is not inside a Git repository\n' "$source_cwd" >&2
@@ -197,6 +232,8 @@ remove_workspace() {
     done
     [[ -n "$agent_cwd" ]] || usage
 
+    acquire_workspace_lock
+
     local metadata=""
     local candidate
     shopt -s nullglob
@@ -252,10 +289,94 @@ remove_workspace() {
     rmdir "$metadata" 2>/dev/null || true
 }
 
+list_workspaces() {
+    local metadata
+    local agent_cwd
+    local branch
+    local repository
+    local worktree_root
+    local task
+
+    shopt -s nullglob
+    for metadata in "$STATE_DIR"/*; do
+        [[ -d "$metadata" && -f "$metadata/agent-cwd" && -f "$metadata/branch" && \
+            -f "$metadata/repository" && -f "$metadata/root" && -f "$metadata/task" ]] || continue
+        agent_cwd=$(<"$metadata/agent-cwd")
+        branch=$(<"$metadata/branch")
+        repository=$(<"$metadata/repository")
+        worktree_root=$(<"$metadata/root")
+        task=$(<"$metadata/task")
+        printf '%s\t%s\t%s\t%s\t%s\n' "$agent_cwd" "$branch" "$repository" "$worktree_root" "$task"
+    done
+}
+
+audit_workspaces() {
+    local source_cwd=""
+    while (($#)); do
+        case "$1" in
+            --cwd) source_cwd=${2:-}; shift 2 ;;
+            *) usage ;;
+        esac
+    done
+    [[ -n "$source_cwd" ]] || usage
+    source_cwd=$(canonical_dir "$source_cwd")
+
+    local source_root
+    source_root=$(git -C "$source_cwd" rev-parse --show-toplevel 2>/dev/null) || return 0
+    source_root=$(canonical_dir "$source_root")
+    mkdir -p -- "$STATE_DIR"
+    local canonical_state_dir
+    canonical_state_dir=$(canonical_dir "$STATE_DIR")
+
+    local line
+    local worktree_path=""
+    local branch_ref=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            worktree\ *) worktree_path=${line#worktree } ;;
+            branch\ *) branch_ref=${line#branch refs/heads/} ;;
+            '')
+                if [[ -d "$worktree_path" ]]; then
+                    worktree_path=$(canonical_dir "$worktree_path")
+                fi
+                if [[ "$branch_ref" == agent-manager/* && "$worktree_path" == "$canonical_state_dir"/*/worktree ]]; then
+                    local known=false
+                    local root_file
+                    shopt -s nullglob
+                    for root_file in "$STATE_DIR"/*/root; do
+                        local recorded_root
+                        recorded_root=$(<"$root_file")
+                        if [[ -d "$recorded_root" ]]; then
+                            recorded_root=$(canonical_dir "$recorded_root")
+                        fi
+                        if [[ "$recorded_root" == "$worktree_path" ]]; then
+                            known=true
+                            break
+                        fi
+                    done
+                    [[ "$known" == true ]] || printf 'UNTRACKED_WORKTREE\t%s\t%s\n' "$worktree_path" "$branch_ref"
+                fi
+                worktree_path=""
+                branch_ref=""
+                ;;
+        esac
+    done < <(git -C "$source_root" worktree list --porcelain; printf '\n')
+
+    local branch
+    while IFS= read -r branch; do
+        [[ -n "$branch" ]] || continue
+        if ! git -C "$source_root" worktree list --porcelain | grep -Fqx "branch refs/heads/$branch"; then
+            printf 'UNATTACHED_BRANCH\t%s\t%s\n' "$source_root" "$branch"
+        fi
+    done < <(git -C "$source_root" for-each-ref --format='%(refname:short)' 'refs/heads/agent-manager/*')
+}
+
 command=${1:-}
 shift || true
 case "$command" in
     create) create_workspace "$@" ;;
     remove) remove_workspace "$@" ;;
+    list) list_workspaces "$@" ;;
+    audit) audit_workspaces "$@" ;;
     *) usage ;;
 esac

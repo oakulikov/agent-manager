@@ -1,9 +1,10 @@
 package manager
 
-import "lib/json" (Json)
+import "lib/json" (Json, jsonGet, jsonParse)
 import "lib/list" (indexOf, map, nth, range)
-import "lib/string" (stringReplace)
-import "lib/term" (bold, confirm, cursorDown, cursorHide, cursorShow, cursorUp, cyan, dim, green, prompt, readKey, red, select, table, termClear, termClearLine, termIsTTY, termRaw, termRestore, yellow)
+import "lib/string" (stringJoin, stringReplace, stringSplit, stringTrim)
+import "lib/term" (bold, confirm, cursorDown, cursorHide, cursorShow, cursorUp, cyan, dim, green, password, prompt, readKey, red, select, table, termClear, termClearLine, termIsTTY, termRaw, termRestore, yellow)
+import "lib/tuple" (fst, snd)
 
 actionNames = [
     "Start agent",
@@ -12,15 +13,19 @@ actionNames = [
     "Stop agent",
     "Resume agent",
     "Watch live events",
+    "Pending requests",
     "Remove agent",
     "Refresh",
     "Quit"
 ]
 
-actionKeys = ["s", "v", "m", "p", "r", "w", "d", "f", "q"]
+actionKeys = ["s", "v", "m", "p", "r", "w", "a", "d", "f", "q"]
 
-fun agentDisplayName(thread: Json) -> String {
-    stringReplace(threadName(thread), prefix, "")
+fun agentDisplayName(thread: Json, cwd: String) -> String {
+    name = threadName(thread)
+    localPrefix = prefix ++ repositoryNamespace(cwd) ++ ":"
+    localName = stringReplace(name, localPrefix, "")
+    if localName == name { stringReplace(name, prefix, "") } else { localName }
 }
 
 fun styledStatus(status: String) -> String {
@@ -33,7 +38,7 @@ fun styledStatus(status: String) -> String {
     }
 }
 
-fun printDashboard(threads: List<Json>) {
+fun printDashboard(threads: List<Json>, cwd: String) {
     print(bold(cyan("Codex Agent Manager")))
     print(dim("Persistent threads and isolated workspaces"))
     print("")
@@ -43,7 +48,7 @@ fun printDashboard(threads: List<Json>) {
         table(
             [bold("Agent"), bold("Status"), bold("Workspace")],
             map(fun(thread) -> [
-                agentDisplayName(thread),
+                agentDisplayName(thread, cwd),
                 styledStatus(threadStatus(thread)),
                 fieldString(thread, "cwd", "?")
             ], threads)
@@ -52,12 +57,12 @@ fun printDashboard(threads: List<Json>) {
     print("")
 }
 
-fun chooseAgent(threads: List<Json>) -> Option<String> {
+fun chooseAgent(threads: List<Json>, cwd: String) -> Option<String> {
     if len(threads) == 0 {
         print(yellow("There are no managed agents."))
         None
     } else {
-        Some(select("Agent", map(agentDisplayName, threads)))
+        Some(select("Agent", map(fun(thread) -> agentDisplayName(thread, cwd), threads)))
     }
 }
 
@@ -72,6 +77,164 @@ fun finishUiAction(result: Result<String, Nil>) {
         Fail(e) -> print(red("Error: " ++ e))
     }
     pauseUi()
+}
+
+fun optionLabel(option: Json) -> String {
+    label = fieldString(option, "label", renderJson(option))
+    description = fieldString(option, "description", "")
+    if description == "" { label } else { label ++ " — " ++ description }
+}
+
+fun promptUserInput(params: Json) -> Result<String, String> {
+    questions = match jsonGet(params, "questions") {
+        Some(JArr(values)) -> values
+        _ -> { return Fail("user-input request has no questions") }
+    }
+    answers = []
+    for question in questions {
+        questionId = fieldString(question, "id", "")
+        if questionId == "" { return Fail("user-input question has no id") }
+        print("")
+        print(bold(fieldString(question, "header", questionId)))
+        print(fieldString(question, "question", ""))
+        answer = match jsonGet(question, "options") {
+            Some(JArr(options)) -> {
+                labels = map(optionLabel, options)
+                choices = if fieldBool(question, "isOther", false) { labels ++ ["Other…"] } else { labels }
+                chosen = select("Answer", choices)
+                match indexOf(labels, chosen) {
+                    Some(index) -> fieldString(nth(options, index), "label", chosen)
+                    None -> if fieldBool(question, "isSecret", false) { password("Other answer") } else { prompt("Other answer", "") }
+                }
+            }
+            _ -> if fieldBool(question, "isSecret", false) { password("Answer") } else { prompt("Answer", "") }
+        }
+        answers = answers ++ [(questionId, JObj([("answers", JArr([JStr(answer)]))]))]
+    }
+    Ok(encodeJsonValue(JObj(answers)))
+}
+
+fun schemaEnumValues(schema: Json) -> List<Json> {
+    match jsonGet(schema, "enum") {
+        Some(JArr(values)) -> values
+        _ -> {
+            match jsonGet(schema, "oneOf") {
+                Some(JArr(options)) -> [
+                    match jsonGet(option, "const") {
+                        Some(value) -> value
+                        None -> JStr(fieldString(option, "title", renderJson(option)))
+                    }
+                    | option <- options
+                ]
+                _ -> []
+            }
+        }
+    }
+}
+
+fun promptSchemaValue(name: String, schema: Json) -> Result<String, Json> {
+    description = fieldString(schema, "description", "")
+    if description != "" { print(dim(description)) }
+    valueType = fieldString(schema, "type", "string")
+    if valueType == "boolean" {
+        Ok(JBool(select(name, ["true", "false"]) == "true"))
+    } else if valueType == "number" || valueType == "integer" {
+        raw = prompt(name, renderJson(fieldObject(schema, "default")))
+        match jsonParse(raw) {
+            Ok(value) -> {
+                match value {
+                    JNum(_) -> Ok(value)
+                    _ -> Fail(name ++ " must be a number")
+                }
+            }
+            Fail(_) -> Fail(name ++ " must be a number")
+        }
+    } else if valueType == "array" {
+        itemSchema = fieldObject(schema, "items")
+        allowed = schemaEnumValues(itemSchema)
+        if len(allowed) > 0 { print("Allowed values: " ++ stringJoin(map(renderJson, allowed), ", ")) }
+        raw = prompt(name ++ " (comma-separated)", "")
+        values = [JStr(stringTrim(value)) | value <- stringSplit(raw, ","), stringTrim(value) != ""]
+        Ok(JArr(values))
+    } else {
+        allowed = schemaEnumValues(schema)
+        if len(allowed) > 0 {
+            labels = map(renderJson, allowed)
+            chosen = select(name, labels)
+            selectedIndex = match indexOf(labels, chosen) { Some(value) -> value None -> 0 }
+            Ok(nth(allowed, selectedIndex))
+        } else {
+            Ok(JStr(prompt(name, fieldString(schema, "default", ""))))
+        }
+    }
+}
+
+fun promptMcpForm(params: Json) -> Result<String, String> {
+    schema = fieldObject(params, "requestedSchema")
+    properties = match jsonGet(schema, "properties") {
+        Some(JObj(fields)) -> fields
+        _ -> {
+            raw = prompt("Answer JSON", "{}")
+            jsonParse(raw)?
+            return Ok(raw)
+        }
+    }
+    content = []
+    for property in properties {
+        content = content ++ [(fst(property), promptSchemaValue(fst(property), snd(property))?)]
+    }
+    Ok(encodeJsonValue(JObj(content)))
+}
+
+fun handlePendingUi(conn: Int) -> Result<String, Nil> {
+    items = getPendingRequests(conn)?
+    if len(items) == 0 {
+        print(yellow("There are no pending requests."))
+        return Ok(nil)
+    }
+    labels = map(pendingRequestLabel, items)
+    selected = select("Pending request", labels)
+    selectedIndex = match indexOf(labels, selected) {
+        Some(value) -> value
+        None -> 0
+    }
+    item = nth(items, selectedIndex)
+    ticket = fieldString(item, "ticket", "")
+    request = fieldObject(item, "request")
+    method = fieldString(request, "method", "")
+    print(renderJson(fieldObject(request, "params")))
+    if fieldString(item, "state", "stale") != "active" {
+        Fail("this request is " ++ fieldString(item, "state", "stale") ++ " and belongs to an old App Server connection")
+    } else if method == "item/tool/requestUserInput" {
+        choice = select("Response", ["Answer all questions", "Decline", "Cancel"])
+        if choice == "Decline" {
+            respondToPending(conn, ticket, "decline", "")
+        } else if choice == "Cancel" {
+            respondToPending(conn, ticket, "cancel", "")
+        } else {
+            answer = promptUserInput(fieldObject(request, "params"))?
+            respondToPending(conn, ticket, "answer", answer)
+        }
+    } else if method == "mcpServer/elicitation/request" {
+        params = fieldObject(request, "params")
+        mode = fieldString(params, "mode", "form")
+        if mode == "url" {
+            print("URL: " ++ fieldString(params, "url", ""))
+            choice = select("Response", ["Accept", "Decline", "Cancel"])
+            respondToPending(conn, ticket, if choice == "Accept" { "approve" } else if choice == "Decline" { "decline" } else { "cancel" }, "")
+        } else {
+            choice = select("Response", ["Answer form", "Decline", "Cancel"])
+            if choice == "Answer form" {
+                respondToPending(conn, ticket, "answer", promptMcpForm(params)?)
+            } else {
+                respondToPending(conn, ticket, if choice == "Decline" { "decline" } else { "cancel" }, "")
+            }
+        }
+    } else {
+        choice = select("Decision", ["Approve once", "Approve for session", "Decline", "Cancel"])
+        action = if choice == "Approve once" { "approve" } else if choice == "Approve for session" { "approve-session" } else if choice == "Cancel" { "cancel" } else { "decline" }
+        respondToPending(conn, ticket, action, "")
+    }
 }
 
 fun renderActionMenu(selected: Int) {
@@ -141,7 +304,7 @@ fun tui(conn: Int, options: Options) -> Result<String, Nil> {
     while true {
         termClear()
         threads = listThreads(conn)?
-        printDashboard(threads)
+        printDashboard(threads, options.cwd)
         action = chooseAction()
         if action == "Quit" {
             return Ok(nil)
@@ -156,8 +319,10 @@ fun tui(conn: Int, options: Options) -> Result<String, Nil> {
                 extra = prompt("Additional instructions (optional)", options.promptText)
                 finishUiAction(startAgent(conn, task, { ...options, promptText: extra }))
             }
+        } else if action == "Pending requests" {
+            finishUiAction(handlePendingUi(conn))
         } else {
-            match chooseAgent(threads) {
+            match chooseAgent(threads, options.cwd) {
                 None -> pauseUi()
                 Some(target) -> {
                     if action == "Show agent" {
@@ -175,7 +340,7 @@ fun tui(conn: Int, options: Options) -> Result<String, Nil> {
                     } else if action == "Resume agent" {
                         finishUiAction(resumeAgent(conn, target, options.cwd))
                     } else if action == "Watch live events" {
-                        match watchAgentInteractive(conn, target, options.cwd) {
+                        match watchAgentInteractive(conn, target, options.cwd, options.supervisorToken) {
                             Ok(_) -> nil
                             Fail(e) -> {
                                 print(red("Error: " ++ e))
@@ -184,7 +349,7 @@ fun tui(conn: Int, options: Options) -> Result<String, Nil> {
                         }
                     } else if action == "Remove agent" {
                         if confirm("Remove " ++ target ++ " and its workspace?", false) {
-                            finishUiAction(removeAgent(conn, target, options.helper))
+                            finishUiAction(removeAgent(conn, target, options.helper, options.cwd))
                         }
                     }
                 }

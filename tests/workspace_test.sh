@@ -37,6 +37,9 @@ AGENT_CWD=$(XDG_STATE_HOME="$STATE_HOME" "$HELPER" create \
 [[ "$AGENT_CWD" != "$REPOSITORY/project" ]] || fail "Git mode reused the source checkout"
 [[ -f "$AGENT_CWD/example.txt" ]] || fail "worktree did not preserve the project subdirectory"
 [[ $(git -C "$AGENT_CWD" symbolic-ref --short HEAD) == agent-manager/* ]] || fail "unexpected task branch"
+XDG_STATE_HOME="$STATE_HOME" "$HELPER" list >"$TEST_ROOT/inventory.log"
+assert_contains "$TEST_ROOT/inventory.log" "$AGENT_CWD"
+[[ -z $(XDG_STATE_HOME="$STATE_HOME" "$HELPER" audit --cwd "$REPOSITORY") ]] || fail "managed worktree was reported as orphaned"
 
 REUSED_CWD=$(XDG_STATE_HOME="$STATE_HOME" "$HELPER" create \
     --task "Example task" --cwd "$REPOSITORY/project" --vcs git)
@@ -93,11 +96,36 @@ ODD_BRANCH=$(git -C "$ODD_CWD" symbolic-ref --short HEAD)
 git check-ref-format "refs/heads/$ODD_BRANCH" || fail "task name produced an invalid Git branch"
 XDG_STATE_HOME="$STATE_HOME" "$HELPER" remove --cwd "$ODD_CWD"
 
+XDG_STATE_HOME="$STATE_HOME" "$HELPER" create \
+    --task "Concurrent task" --cwd "$REPOSITORY/project" --vcs git \
+    >"$TEST_ROOT/concurrent-one.out" &
+FIRST_PID=$!
+XDG_STATE_HOME="$STATE_HOME" "$HELPER" create \
+    --task "Concurrent task" --cwd "$REPOSITORY/project" --vcs git \
+    >"$TEST_ROOT/concurrent-two.out" &
+SECOND_PID=$!
+wait "$FIRST_PID"
+wait "$SECOND_PID"
+FIRST_CWD=$(<"$TEST_ROOT/concurrent-one.out")
+SECOND_CWD=$(<"$TEST_ROOT/concurrent-two.out")
+[[ "$FIRST_CWD" == "$SECOND_CWD" ]] || fail "concurrent create returned different worktrees"
+XDG_STATE_HOME="$STATE_HOME" "$HELPER" remove --cwd "$FIRST_CWD"
+
 PLAIN_DIR="$TEST_ROOT/plain"
 mkdir -p -- "$PLAIN_DIR"
 PLAIN_RESULT=$(XDG_STATE_HOME="$STATE_HOME" "$HELPER" create \
     --task "Plain task" --cwd "$PLAIN_DIR" --vcs none)
 PLAIN_EXPECTED=$(cd -- "$PLAIN_DIR" && pwd -P)
 [[ "$PLAIN_RESULT" == "$PLAIN_EXPECTED" ]] || fail "non-Git mode changed cwd"
+
+ORPHAN_ROOT="$STATE_HOME/agent-manager/workspaces/manual-orphan/worktree"
+mkdir -p -- "${ORPHAN_ROOT%/worktree}"
+git -C "$REPOSITORY" worktree add -b agent-manager/manual-orphan "$ORPHAN_ROOT" HEAD >/dev/null
+XDG_STATE_HOME="$STATE_HOME" "$HELPER" audit --cwd "$REPOSITORY" >"$TEST_ROOT/audit.log"
+assert_contains "$TEST_ROOT/audit.log" "UNTRACKED_WORKTREE"
+git -C "$REPOSITORY" worktree remove "$ORPHAN_ROOT"
+XDG_STATE_HOME="$STATE_HOME" "$HELPER" audit --cwd "$REPOSITORY" >"$TEST_ROOT/branch-audit.log"
+assert_contains "$TEST_ROOT/branch-audit.log" "UNATTACHED_BRANCH"
+git -C "$REPOSITORY" branch -D agent-manager/manual-orphan >/dev/null
 
 printf 'workspace integration tests passed\n'

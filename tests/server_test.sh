@@ -30,7 +30,13 @@ printf '%s\n' '[[ -f ${FAKE_SERVER_READY:?} ]]' >>"$FAKE_BIN/funxy"
 printf '%s\n' '#!/usr/bin/env bash' >"$FAKE_BIN/codex"
 printf '%s\n' 'touch "${FAKE_SERVER_READY:?}"' >>"$FAKE_BIN/codex"
 printf '%s\n' 'exec sleep 60' >>"$FAKE_BIN/codex"
-chmod +x "$FAKE_BIN/funxy" "$FAKE_BIN/codex"
+
+printf '%s\n' '#!/usr/bin/env bash' >"$FAKE_BIN/ps"
+printf '%s\n' 'case "$*" in' >>"$FAKE_BIN/ps"
+printf '%s\n' '  *command=*) printf "codex app-server --listen %s\\n" "${AGENT_MANAGER_SERVER:-}" ;;' >>"$FAKE_BIN/ps"
+printf '%s\n' '  *) printf "Fri Aug  1 12:00:00 2026\\n" ;;' >>"$FAKE_BIN/ps"
+printf '%s\n' 'esac' >>"$FAKE_BIN/ps"
+chmod +x "$FAKE_BIN/funxy" "$FAKE_BIN/codex" "$FAKE_BIN/ps"
 
 TEST_PATH="$FAKE_BIN:/usr/bin:/bin"
 STATE_HOME="$TEST_ROOT/state"
@@ -49,8 +55,18 @@ assert_contains "$TEST_ROOT/external-stop.log" "externally managed"
 
 FAKE_SERVER_MODE=managed FAKE_SERVER_READY="$READY_FILE" PATH="$TEST_PATH" \
     XDG_STATE_HOME="$STATE_HOME" AGENT_MANAGER_SERVER=ws://127.0.0.1:15999 \
-    "$PROJECT_DIR/agent-manager" server-start >"$TEST_ROOT/managed-start.log"
+    "$PROJECT_DIR/agent-manager" server-start >"$TEST_ROOT/managed-start.log" &
+FIRST_START_PID=$!
+FAKE_SERVER_MODE=managed FAKE_SERVER_READY="$READY_FILE" PATH="$TEST_PATH" \
+    XDG_STATE_HOME="$STATE_HOME" AGENT_MANAGER_SERVER=ws://127.0.0.1:15999 \
+    "$PROJECT_DIR/agent-manager" server-start >"$TEST_ROOT/concurrent-start.log" &
+SECOND_START_PID=$!
+wait "$FIRST_START_PID"
+wait "$SECOND_START_PID"
 assert_contains "$TEST_ROOT/managed-start.log" "managed-process"
+assert_contains "$TEST_ROOT/concurrent-start.log" "managed-process"
+[[ $(find "$STATE_HOME/agent-manager" -name '*.pid' | wc -l | tr -d ' ') -eq 1 ]] || \
+    fail "concurrent starts created multiple PID files"
 
 FAKE_SERVER_MODE=managed FAKE_SERVER_READY="$READY_FILE" PATH="$TEST_PATH" \
     XDG_STATE_HOME="$STATE_HOME" AGENT_MANAGER_SERVER=ws://127.0.0.1:15999 \
@@ -59,10 +75,22 @@ assert_contains "$TEST_ROOT/managed-status.log" "managed-process"
 
 FAKE_SERVER_MODE=managed FAKE_SERVER_READY="$READY_FILE" PATH="$TEST_PATH" \
     XDG_STATE_HOME="$STATE_HOME" AGENT_MANAGER_SERVER=ws://127.0.0.1:15999 \
-    "$PROJECT_DIR/agent-manager" server-stop >"$TEST_ROOT/managed-stop.log"
+    "$PROJECT_DIR/agent-manager" server-stop >"$TEST_ROOT/managed-stop.log" 2>&1
 assert_contains "$TEST_ROOT/managed-stop.log" "Stopped managed"
 if find "$STATE_HOME/agent-manager" -name '*.pid' -print | grep . >/dev/null; then
     fail "stale App Server PID file remains"
 fi
+
+rm -f -- "$READY_FILE"
+SERVER_KEY=$(printf '%s' ws://127.0.0.1:15999 | cksum | awk '{ print $1 }')
+STALE_PID_FILE="$STATE_HOME/agent-manager/app-server-$SERVER_KEY.pid"
+printf '%s\n%s\n' "$$" "Thu Jan  1 00:00:00 1970" >"$STALE_PID_FILE"
+if FAKE_SERVER_MODE=managed FAKE_SERVER_READY="$READY_FILE" PATH="$TEST_PATH" \
+    XDG_STATE_HOME="$STATE_HOME" AGENT_MANAGER_SERVER=ws://127.0.0.1:15999 \
+    "$PROJECT_DIR/agent-manager" server-status >"$TEST_ROOT/stale-status.log"; then
+    fail "reused PID was accepted as an owned App Server"
+fi
+assert_contains "$TEST_ROOT/stale-status.log" "stopped"
+[[ ! -f "$STALE_PID_FILE" ]] || fail "stale reused PID file was not removed"
 
 printf 'server lifecycle tests passed\n'

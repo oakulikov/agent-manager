@@ -1,4 +1,9 @@
-package manager (Options, runManager, usage, version)
+package manager (Options, managedName, runManager, usage, version)
+
+import "lib/crypto" (sha256)
+import "lib/list" (take)
+import "lib/string" (stringTrim)
+import "lib/sys" (sysExec)
 
 type alias Options = {
     cwd: String,
@@ -9,12 +14,27 @@ type alias Options = {
     approval: String,
     sandbox: String,
     workspace: String,
-    helper: String
+    helper: String,
+    supervisorToken: String
 }
 
 prefix = "agent-manager:"
-version = "0.3.0"
+version = "0.6.0"
 
-fun managedName(task: String) -> String {
-    prefix ++ task
+fun repositoryIdentity(cwd: String) -> String {
+    commonDir = sysExec("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if commonDir.code == 0 {
+        stringTrim(commonDir.stdout)
+    } else {
+        root = sysExec("git", ["-C", cwd, "rev-parse", "--show-toplevel"])
+        if root.code == 0 { stringTrim(root.stdout) } else { cwd }
+    }
+}
+
+fun repositoryNamespace(cwd: String) -> String {
+    take(sha256(repositoryIdentity(cwd)), 10)
+}
+
+fun managedName(task: String, cwd: String) -> String {
+    prefix ++ repositoryNamespace(cwd) ++ ":" ++ task
 }

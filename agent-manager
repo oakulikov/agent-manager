@@ -14,7 +14,30 @@ SERVER_URL=${AGENT_MANAGER_SERVER:-$DEFAULT_SERVER_URL}
 SERVER_KEY=$(printf '%s' "$SERVER_URL" | cksum | awk '{ print $1 }')
 PID_FILE="$STATE_DIR/app-server-$SERVER_KEY.pid"
 LOG_FILE="$STATE_DIR/app-server-$SERVER_KEY.log"
+SERVER_LOCK_DIR="$STATE_DIR/app-server-$SERVER_KEY.lock"
 SERVICE_NAME=agent-manager-app-server.service
+SUPERVISOR_SERVICE_NAME=agent-manager-supervisor.service
+APP_SERVER_LAUNCHD_LABEL=dev.funxy.agent-manager.app-server
+SUPERVISOR_LAUNCHD_LABEL=dev.funxy.agent-manager.supervisor
+APP_SERVER_LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$APP_SERVER_LAUNCHD_LABEL.plist"
+SUPERVISOR_LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$SUPERVISOR_LAUNCHD_LABEL.plist"
+DEFAULT_SUPERVISOR_URL=ws://127.0.0.1:14552
+SUPERVISOR_URL=${AGENT_MANAGER_CONTROL:-$DEFAULT_SUPERVISOR_URL}
+SUPERVISOR_PORT=${SUPERVISOR_URL##*:}
+SUPERVISOR_STATE_DIR="$STATE_DIR/supervisor-$SERVER_KEY"
+SUPERVISOR_PID_FILE="$STATE_DIR/supervisor-$SERVER_KEY.pid"
+SUPERVISOR_LOG_FILE="$STATE_DIR/supervisor-$SERVER_KEY.log"
+SUPERVISOR_LOCK_DIR="$STATE_DIR/supervisor-$SERVER_KEY.lock"
+SUPERVISOR_TOKEN_FILE="$STATE_DIR/supervisor-$SERVER_KEY.token"
+
+[[ "$SUPERVISOR_URL" == ws://127.0.0.1:* || "$SUPERVISOR_URL" == ws://localhost:* ]] || {
+    printf 'AGENT_MANAGER_CONTROL must use a loopback ws:// URL: %s\n' "$SUPERVISOR_URL" >&2
+    exit 2
+}
+[[ "$SUPERVISOR_PORT" =~ ^[0-9]+$ ]] || {
+    printf 'Cannot determine supervisor port from %s\n' "$SUPERVISOR_URL" >&2
+    exit 2
+}
 
 detect_vcs() {
     if git -C "$PWD" rev-parse --show-toplevel >/dev/null 2>&1; then
@@ -27,14 +50,302 @@ detect_vcs() {
 server_pid() {
     if [[ -f "$PID_FILE" ]]; then
         local pid
-        pid=$(<"$PID_FILE")
+        local recorded_start
+        local actual_start
+        local command
+        pid=$(sed -n '1p' "$PID_FILE")
+        recorded_start=$(sed -n '2p' "$PID_FILE")
         if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-            printf '%s\n' "$pid"
-            return 0
+            actual_start=$(ps -p "$pid" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || true)
+            if [[ -n "$recorded_start" && "$recorded_start" == "$actual_start" ]]; then
+                printf '%s\n' "$pid"
+                return 0
+            fi
+            # Upgrade one-line PID files written by Agent Manager 0.3.0.
+            if [[ -z "$recorded_start" ]]; then
+                command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+                if [[ -n "$actual_start" && "$command" == *"codex app-server"* && "$command" == *"--listen $SERVER_URL"* ]]; then
+                    printf '%s\n%s\n' "$pid" "$actual_start" >"$PID_FILE"
+                    printf '%s\n' "$pid"
+                    return 0
+                fi
+            fi
         fi
         rm -f -- "$PID_FILE"
     fi
     return 1
+}
+
+acquire_server_lock() {
+    local owner=""
+    mkdir -p -- "$STATE_DIR"
+    for _ in {1..200}; do
+        if mkdir -- "$SERVER_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" >"$SERVER_LOCK_DIR/owner"
+            trap release_server_lock EXIT
+            return 0
+        fi
+        if [[ -f "$SERVER_LOCK_DIR/owner" ]]; then
+            owner=$(<"$SERVER_LOCK_DIR/owner")
+            if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+                rm -f -- "$SERVER_LOCK_DIR/owner"
+                rmdir "$SERVER_LOCK_DIR" 2>/dev/null || true
+                continue
+            fi
+        fi
+        sleep 0.05
+    done
+    printf 'Timed out waiting for App Server lock: %s\n' "$SERVER_LOCK_DIR" >&2
+    exit 1
+}
+
+release_server_lock() {
+    if [[ -f "$SERVER_LOCK_DIR/owner" ]] && [[ "$(<"$SERVER_LOCK_DIR/owner")" == "$$" ]]; then
+        rm -f -- "$SERVER_LOCK_DIR/owner"
+        rmdir "$SERVER_LOCK_DIR" 2>/dev/null || true
+    fi
+}
+
+finish_server_lock() {
+    release_server_lock
+    trap - EXIT
+}
+
+write_server_pid() {
+    local pid=$1
+    local started=""
+    for _ in {1..20}; do
+        started=$(ps -p "$pid" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || true)
+        [[ -n "$started" ]] && break
+        sleep 0.01
+    done
+    [[ -n "$started" ]] || {
+        printf 'Could not read start time for Codex App Server pid %s\n' "$pid" >&2
+        return 1
+    }
+    printf '%s\n%s\n' "$pid" "$started" >"$PID_FILE"
+}
+
+ensure_supervisor_token() {
+    umask 077
+    if [[ ! -s "$SUPERVISOR_TOKEN_FILE" ]]; then
+        mkdir -p -- "$STATE_DIR"
+        if command -v openssl >/dev/null 2>&1; then
+            openssl rand -hex 32 >"$SUPERVISOR_TOKEN_FILE"
+        else
+            od -An -N32 -tx1 /dev/urandom | tr -d ' \n' >"$SUPERVISOR_TOKEN_FILE"
+            printf '\n' >>"$SUPERVISOR_TOKEN_FILE"
+        fi
+    fi
+    chmod 600 "$SUPERVISOR_TOKEN_FILE"
+    SUPERVISOR_TOKEN=$(<"$SUPERVISOR_TOKEN_FILE")
+    [[ -n "$SUPERVISOR_TOKEN" ]] || {
+        printf 'Supervisor token file is empty: %s\n' "$SUPERVISOR_TOKEN_FILE" >&2
+        return 1
+    }
+}
+
+supervisor_pid() {
+    if [[ -f "$SUPERVISOR_PID_FILE" ]]; then
+        local pid
+        local recorded_start
+        local actual_start
+        local command
+        pid=$(sed -n '1p' "$SUPERVISOR_PID_FILE")
+        recorded_start=$(sed -n '2p' "$SUPERVISOR_PID_FILE")
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            actual_start=$(ps -p "$pid" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || true)
+            command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+            if [[ -n "$recorded_start" && "$recorded_start" == "$actual_start" && \
+                "$command" == *"supervisor.lang"* && "$command" == *"--port $SUPERVISOR_PORT"* ]]; then
+                printf '%s\n' "$pid"
+                return 0
+            fi
+        fi
+        rm -f -- "$SUPERVISOR_PID_FILE"
+    fi
+    return 1
+}
+
+write_supervisor_pid() {
+    local pid=$1
+    local started=""
+    for _ in {1..20}; do
+        started=$(ps -p "$pid" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || true)
+        [[ -n "$started" ]] && break
+        sleep 0.01
+    done
+    [[ -n "$started" ]] || return 1
+    printf '%s\n%s\n' "$pid" "$started" >"$SUPERVISOR_PID_FILE"
+}
+
+acquire_supervisor_lock() {
+    local owner=""
+    mkdir -p -- "$STATE_DIR"
+    for _ in {1..200}; do
+        if mkdir -- "$SUPERVISOR_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" >"$SUPERVISOR_LOCK_DIR/owner"
+            trap release_supervisor_lock EXIT
+            return 0
+        fi
+        if [[ -f "$SUPERVISOR_LOCK_DIR/owner" ]]; then
+            owner=$(<"$SUPERVISOR_LOCK_DIR/owner")
+            if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+                rm -f -- "$SUPERVISOR_LOCK_DIR/owner"
+                rmdir "$SUPERVISOR_LOCK_DIR" 2>/dev/null || true
+                continue
+            fi
+        fi
+        sleep 0.05
+    done
+    printf 'Timed out waiting for supervisor lock: %s\n' "$SUPERVISOR_LOCK_DIR" >&2
+    exit 1
+}
+
+release_supervisor_lock() {
+    if [[ -f "$SUPERVISOR_LOCK_DIR/owner" ]] && [[ "$(<"$SUPERVISOR_LOCK_DIR/owner")" == "$$" ]]; then
+        rm -f -- "$SUPERVISOR_LOCK_DIR/owner"
+        rmdir "$SUPERVISOR_LOCK_DIR" 2>/dev/null || true
+    fi
+}
+
+finish_supervisor_lock() {
+    release_supervisor_lock
+    trap - EXIT
+}
+
+supervisor_ready() {
+    ensure_supervisor_token
+    funxy "$TOOL_DIR/manager.lang" --server "$SUPERVISOR_URL" \
+        --supervisor-token "$SUPERVISOR_TOKEN" --cwd "$PWD" doctor >/dev/null 2>&1
+}
+
+supervisor_systemd_unit_available() {
+    [[ "$SERVER_URL" == "$DEFAULT_SERVER_URL" && "$SUPERVISOR_URL" == "$DEFAULT_SUPERVISOR_URL" ]] && \
+        command -v systemctl >/dev/null 2>&1 && \
+        systemctl --user cat "$SUPERVISOR_SERVICE_NAME" >/dev/null 2>&1
+}
+
+supervisor_systemd_unit_active() {
+    supervisor_systemd_unit_available && systemctl --user is-active --quiet "$SUPERVISOR_SERVICE_NAME"
+}
+
+launchd_job_loaded() {
+    command -v launchctl >/dev/null 2>&1 && launchctl print "gui/$UID/$1" >/dev/null 2>&1
+}
+
+launchd_start_job() {
+    local label=$1
+    local plist=$2
+    if ! launchd_job_loaded "$label"; then
+        launchctl bootstrap "gui/$UID" "$plist" >/dev/null
+    fi
+    launchctl kickstart "gui/$UID/$label" >/dev/null 2>&1 || true
+}
+
+supervisor_launchd_available() {
+    [[ "$SERVER_URL" == "$DEFAULT_SERVER_URL" && "$SUPERVISOR_URL" == "$DEFAULT_SUPERVISOR_URL" && \
+        -f "$SUPERVISOR_LAUNCHD_PLIST" ]] && command -v launchctl >/dev/null 2>&1
+}
+
+start_supervisor() {
+    if supervisor_ready; then
+        return
+    fi
+    acquire_supervisor_lock
+    if supervisor_ready; then
+        finish_supervisor_lock
+        return
+    fi
+    mkdir -p -- "$SUPERVISOR_STATE_DIR"
+    local pid=""
+    if supervisor_systemd_unit_available; then
+        systemctl --user start "$SUPERVISOR_SERVICE_NAME"
+    elif supervisor_launchd_available; then
+        launchd_start_job "$SUPERVISOR_LAUNCHD_LABEL" "$SUPERVISOR_LAUNCHD_PLIST"
+    else
+        nohup funxy "$TOOL_DIR/supervisor.lang" \
+            --upstream "$SERVER_URL" \
+            --port "$SUPERVISOR_PORT" \
+            --state "$SUPERVISOR_STATE_DIR" \
+            --token-file "$SUPERVISOR_TOKEN_FILE" >"$SUPERVISOR_LOG_FILE" 2>&1 &
+        pid=$!
+        if ! write_supervisor_pid "$pid"; then
+            kill "$pid" 2>/dev/null || true
+            finish_supervisor_lock
+            return 1
+        fi
+    fi
+    for _ in {1..80}; do
+        if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+            rm -f -- "$SUPERVISOR_PID_FILE"
+            printf 'Agent Manager supervisor exited; see %s\n' "$SUPERVISOR_LOG_FILE" >&2
+            exit 1
+        fi
+        if supervisor_ready; then
+            finish_supervisor_lock
+            return
+        fi
+        sleep 0.05
+    done
+    if [[ -n "$pid" ]]; then
+        kill "$pid" 2>/dev/null || true
+        rm -f -- "$SUPERVISOR_PID_FILE"
+    fi
+    printf 'Agent Manager supervisor did not become ready; see %s\n' "$SUPERVISOR_LOG_FILE" >&2
+    exit 1
+}
+
+supervisor_status() {
+    local pid
+    if pid=$(supervisor_pid); then
+        printf 'Agent Manager supervisor: managed-process (pid %s, %s)\n' "$pid" "$SUPERVISOR_URL"
+    elif supervisor_systemd_unit_active; then
+        printf 'Agent Manager supervisor: systemd (%s)\n' "$SUPERVISOR_URL"
+    elif launchd_job_loaded "$SUPERVISOR_LAUNCHD_LABEL" && supervisor_ready; then
+        printf 'Agent Manager supervisor: launchd (%s)\n' "$SUPERVISOR_URL"
+    elif supervisor_ready; then
+        printf 'Agent Manager supervisor: external-compatible (%s)\n' "$SUPERVISOR_URL"
+    else
+        printf 'Agent Manager supervisor: stopped (%s)\n' "$SUPERVISOR_URL"
+        return 1
+    fi
+}
+
+stop_supervisor() {
+    local pid
+    acquire_supervisor_lock
+    if supervisor_systemd_unit_active; then
+        systemctl --user stop "$SUPERVISOR_SERVICE_NAME"
+        printf 'Stopped systemd Agent Manager supervisor\n'
+        finish_supervisor_lock
+        return 0
+    elif launchd_job_loaded "$SUPERVISOR_LAUNCHD_LABEL"; then
+        launchctl bootout "gui/$UID/$SUPERVISOR_LAUNCHD_LABEL" >/dev/null
+        printf 'Stopped launchd Agent Manager supervisor\n'
+        finish_supervisor_lock
+        return 0
+    elif pid=$(supervisor_pid); then
+        kill "$pid"
+        for _ in {1..40}; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                rm -f -- "$SUPERVISOR_PID_FILE"
+                printf 'Stopped Agent Manager supervisor (pid %s)\n' "$pid"
+                finish_supervisor_lock
+                return 0
+            fi
+            sleep 0.1
+        done
+        printf 'Agent Manager supervisor pid %s did not stop\n' "$pid" >&2
+        return 1
+    elif supervisor_ready; then
+        printf 'Agent Manager supervisor is externally managed; not stopping %s\n' "$SUPERVISOR_URL" >&2
+        finish_supervisor_lock
+        return 1
+    else
+        printf 'Agent Manager supervisor is not running (%s)\n' "$SUPERVISOR_URL"
+        finish_supervisor_lock
+    fi
 }
 
 endpoint_ready() {
@@ -51,12 +362,19 @@ systemd_unit_active() {
     systemd_unit_available && systemctl --user is-active --quiet "$SERVICE_NAME"
 }
 
+app_server_launchd_available() {
+    [[ "$SERVER_URL" == "$DEFAULT_SERVER_URL" && -f "$APP_SERVER_LAUNCHD_PLIST" ]] && \
+        command -v launchctl >/dev/null 2>&1
+}
+
 server_status() {
     local pid
     if pid=$(server_pid); then
         printf 'Codex App Server: managed-process (pid %s, %s)\n' "$pid" "$SERVER_URL"
     elif systemd_unit_active; then
         printf 'Codex App Server: systemd (%s)\n' "$SERVER_URL"
+    elif launchd_job_loaded "$APP_SERVER_LAUNCHD_LABEL" && endpoint_ready; then
+        printf 'Codex App Server: launchd (%s)\n' "$SERVER_URL"
     elif endpoint_ready; then
         printf 'Codex App Server: external (%s)\n' "$SERVER_URL"
     else
@@ -69,14 +387,24 @@ start_server() {
     if endpoint_ready; then
         return
     fi
-    mkdir -p "$STATE_DIR"
+    acquire_server_lock
+    if endpoint_ready; then
+        finish_server_lock
+        return
+    fi
     local pid=""
     if systemd_unit_available; then
         systemctl --user start "$SERVICE_NAME"
+    elif app_server_launchd_available; then
+        launchd_start_job "$APP_SERVER_LAUNCHD_LABEL" "$APP_SERVER_LAUNCHD_PLIST"
     else
         nohup codex app-server --listen "$SERVER_URL" >"$LOG_FILE" 2>&1 &
         pid=$!
-        printf '%s\n' "$pid" >"$PID_FILE"
+        if ! write_server_pid "$pid"; then
+            kill "$pid" 2>/dev/null || true
+            finish_server_lock
+            return 1
+        fi
     fi
     for _ in {1..40}; do
         if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
@@ -85,23 +413,30 @@ start_server() {
             exit 1
         fi
         if endpoint_ready; then
+            finish_server_lock
             return
         fi
         sleep 0.1
     done
     funxy "$TOOL_DIR/manager.lang" --server "$SERVER_URL" --cwd "$PWD" doctor >&2 || true
     printf 'Codex App Server did not become ready; see %s\n' "$LOG_FILE" >&2
+    if [[ -n "$pid" ]]; then
+        kill "$pid" 2>/dev/null || true
+        rm -f -- "$PID_FILE"
+    fi
     exit 1
 }
 
 stop_server() {
     local pid
+    acquire_server_lock
     if pid=$(server_pid); then
         kill "$pid"
         for _ in {1..40}; do
             if ! kill -0 "$pid" 2>/dev/null; then
                 rm -f -- "$PID_FILE"
                 printf 'Stopped managed Codex App Server (pid %s)\n' "$pid"
+                finish_server_lock
                 return 0
             fi
             sleep 0.1
@@ -111,17 +446,29 @@ stop_server() {
     elif systemd_unit_active; then
         systemctl --user stop "$SERVICE_NAME"
         printf 'Stopped systemd Codex App Server\n'
+        finish_server_lock
+    elif launchd_job_loaded "$APP_SERVER_LAUNCHD_LABEL"; then
+        launchctl bootout "gui/$UID/$APP_SERVER_LAUNCHD_LABEL" >/dev/null
+        printf 'Stopped launchd Codex App Server\n'
+        finish_server_lock
     elif endpoint_ready; then
         printf 'Codex App Server is externally managed; not stopping %s\n' "$SERVER_URL" >&2
+        finish_server_lock
         return 1
     else
         printf 'Codex App Server is not running (%s)\n' "$SERVER_URL"
+        finish_server_lock
     fi
 }
 
 show_server_log() {
     local pid
-    if systemd_unit_active; then
+    if supervisor_pid >/dev/null && [[ -f "$SUPERVISOR_LOG_FILE" ]]; then
+        if [[ -f "$LOG_FILE" ]]; then
+            exec tail -f "$SUPERVISOR_LOG_FILE" "$LOG_FILE"
+        fi
+        exec tail -f "$SUPERVISOR_LOG_FILE"
+    elif systemd_unit_active; then
         exec journalctl --user -u "$SERVICE_NAME" -f
     elif pid=$(server_pid); then
         exec tail -f "$LOG_FILE"
@@ -137,6 +484,16 @@ show_server_log() {
 }
 
 case "${1:-}" in
+    supervisor-run)
+        command -v funxy >/dev/null || { printf 'funxy is not installed\n' >&2; exit 1; }
+        ensure_supervisor_token
+        mkdir -p -- "$SUPERVISOR_STATE_DIR"
+        exec funxy "$TOOL_DIR/supervisor.lang" \
+            --upstream "$SERVER_URL" \
+            --port "$SUPERVISOR_PORT" \
+            --state "$SUPERVISOR_STATE_DIR" \
+            --token-file "$SUPERVISOR_TOKEN_FILE"
+        ;;
     login)
         command -v codex >/dev/null || { printf 'codex is not installed\n' >&2; exit 1; }
         shift
@@ -150,16 +507,21 @@ case "${1:-}" in
         command -v funxy >/dev/null || { printf 'funxy is not installed\n' >&2; exit 1; }
         command -v codex >/dev/null || { printf 'codex is not installed\n' >&2; exit 1; }
         start_server
+        start_supervisor
         server_status
+        supervisor_status
         exit 0
         ;;
     server-status)
         command -v funxy >/dev/null || { printf 'funxy is not installed\n' >&2; exit 1; }
-        server_status
-        exit 0
+        status=0
+        server_status || status=$?
+        supervisor_status || status=$?
+        exit "$status"
         ;;
     server-stop)
         command -v funxy >/dev/null || { printf 'funxy is not installed\n' >&2; exit 1; }
+        stop_supervisor || true
         stop_server
         exit 0
         ;;
@@ -171,6 +533,9 @@ case "${1:-}" in
         install_dir=${XDG_DATA_HOME:-"$HOME/.local/share"}/agent-manager
         bin_dir=${XDG_BIN_HOME:-"$HOME/.local/bin"}
         unit_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user
+        launchd_dir="$HOME/Library/LaunchAgents"
+        service_layout_supported=false
+        [[ "$install_dir" == "$HOME/.local/share/agent-manager" ]] && service_layout_supported=true
         command -v funxy >/dev/null || { printf 'funxy is not installed\n' >&2; exit 1; }
         command -v codex >/dev/null || { printf 'codex is not installed\n' >&2; exit 1; }
         mkdir -p "$install_dir/manager" "$bin_dir"
@@ -181,16 +546,28 @@ case "${1:-}" in
         done
         install -m 0755 "$TOOL_DIR/agent-manager" "$install_dir/agent-manager"
         install -m 0755 "$TOOL_DIR/workspace.sh" "$install_dir/workspace.sh"
+        install -m 0644 "$TOOL_DIR/supervisor.lang" "$install_dir/supervisor.lang"
         ln -sfn "$install_dir/agent-manager" "$bin_dir/agent-manager"
-        if command -v systemctl >/dev/null 2>&1; then
+        if [[ "$service_layout_supported" == true ]] && command -v systemctl >/dev/null 2>&1; then
             mkdir -p "$unit_dir"
             install -m 0644 "$TOOL_DIR/agent-manager-app-server.service" "$install_dir/agent-manager-app-server.service"
+            install -m 0644 "$TOOL_DIR/agent-manager-supervisor.service" "$install_dir/agent-manager-supervisor.service"
             install -m 0644 "$install_dir/agent-manager-app-server.service" "$unit_dir/$SERVICE_NAME"
+            install -m 0644 "$install_dir/agent-manager-supervisor.service" "$unit_dir/$SUPERVISOR_SERVICE_NAME"
         fi
-        if command -v systemctl >/dev/null 2>&1 && systemctl --user daemon-reload >/dev/null 2>&1 && systemctl --user enable --now "$SERVICE_NAME"; then
-            printf 'Enabled %s\n' "$SERVICE_NAME"
+        if [[ "$service_layout_supported" == true ]] && command -v systemctl >/dev/null 2>&1 && \
+            systemctl --user daemon-reload >/dev/null 2>&1 && \
+            systemctl --user enable --now "$SERVICE_NAME" "$SUPERVISOR_SERVICE_NAME"; then
+            printf 'Enabled %s and %s\n' "$SERVICE_NAME" "$SUPERVISOR_SERVICE_NAME"
+        elif [[ "$service_layout_supported" == true && "$(uname -s)" == Darwin ]] && command -v launchctl >/dev/null 2>&1; then
+            mkdir -p "$launchd_dir"
+            install -m 0644 "$TOOL_DIR/dev.funxy.agent-manager.app-server.plist" "$APP_SERVER_LAUNCHD_PLIST"
+            install -m 0644 "$TOOL_DIR/dev.funxy.agent-manager.supervisor.plist" "$SUPERVISOR_LAUNCHD_PLIST"
+            launchd_start_job "$APP_SERVER_LAUNCHD_LABEL" "$APP_SERVER_LAUNCHD_PLIST"
+            launchd_start_job "$SUPERVISOR_LAUNCHD_LABEL" "$SUPERVISOR_LAUNCHD_PLIST"
+            printf 'Enabled launchd jobs %s and %s\n' "$APP_SERVER_LAUNCHD_LABEL" "$SUPERVISOR_LAUNCHD_LABEL"
         else
-            printf 'User systemd is unavailable; the launcher will use a nohup fallback\n' >&2
+            printf 'Persistent service installation is unavailable for this platform/layout; the launcher will use a nohup fallback\n' >&2
         fi
         printf 'Installed %s/agent-manager\n' "$bin_dir"
         exit 0
@@ -200,6 +577,8 @@ esac
 command -v funxy >/dev/null || { printf 'funxy is not installed\n' >&2; exit 1; }
 command -v codex >/dev/null || { printf 'codex is not installed\n' >&2; exit 1; }
 start_server
+start_supervisor
+ensure_supervisor_token
 
 manager_flags=(--workspace-helper "$TOOL_DIR/workspace.sh")
 manager_args=()
@@ -224,4 +603,16 @@ while (($#)); do
     esac
 done
 
-exec funxy "$TOOL_DIR/manager.lang" --server "$SERVER_URL" --cwd "$PWD" --vcs "$(detect_vcs)" "${manager_flags[@]}" "${manager_args[@]}"
+restore_terminal() {
+    [[ -t 0 ]] || return 0
+    stty sane 2>/dev/null || true
+    printf '\033[?25h' >/dev/tty 2>/dev/null || true
+}
+
+if [[ "${manager_args[0]:-}" == ui || "${manager_args[0]:-}" == watch ]]; then
+    trap restore_terminal EXIT INT TERM
+    funxy "$TOOL_DIR/manager.lang" --server "$SUPERVISOR_URL" --supervisor-token "$SUPERVISOR_TOKEN" --cwd "$PWD" --vcs "$(detect_vcs)" "${manager_flags[@]}" "${manager_args[@]}"
+    exit $?
+fi
+
+exec funxy "$TOOL_DIR/manager.lang" --server "$SUPERVISOR_URL" --supervisor-token "$SUPERVISOR_TOKEN" --cwd "$PWD" --vcs "$(detect_vcs)" "${manager_flags[@]}" "${manager_args[@]}"

@@ -4,9 +4,9 @@ Run persistent Codex agents in isolated Git worktrees from a terminal UI or a
 small CLI. Each agent gets its own task branch and working directory, while all
 worktrees share the repository's Git object database.
 
-Agent Manager talks directly to Codex App Server. You can detach from the UI,
-return later, send more instructions, or stop and resume a thread without
-losing its workspace.
+Agent Manager uses a persistent local supervisor in front of Codex App Server.
+You can detach from the UI, return later, answer approval requests, send more
+instructions, or stop and resume a thread without losing its workspace.
 
 ## Why use it?
 
@@ -85,8 +85,12 @@ agent-manager self-test
 
 The installer puts application files in `~/.local/share/agent-manager` and
 links the command into `~/.local/bin`. Make sure `~/.local/bin` is on `PATH`.
-On Linux with user systemd, it also installs an App Server service. On macOS or
-systems without user systemd, the launcher starts App Server with `nohup`.
+On Linux with user systemd, it installs restartable services for both App
+Server and the authenticated supervisor. On macOS it installs equivalent
+`launchd` agents with `KeepAlive`. Systems without either service manager use a
+portable `nohup` fallback and start both processes on the first command.
+Service templates use the default `~/.local/share/agent-manager` data layout;
+a custom `XDG_DATA_HOME` intentionally uses the fallback.
 
 ## Quick start
 
@@ -117,6 +121,9 @@ agent-manager start local-task --workspace current
 
 Only one managed agent can own a given directory. Outside a Git repository,
 `auto` uses the current directory and therefore also permits only one agent.
+Thread identity includes a short hash of Git's common directory, so the same
+task name can be used independently in different repositories and worktrees.
+The dashboard keeps the task name short for the repository where it was opened.
 
 ## Commands
 
@@ -128,6 +135,14 @@ agent-manager send NAME|THREAD MESSAGE
 agent-manager stop NAME|THREAD
 agent-manager resume NAME|THREAD
 agent-manager watch NAME|THREAD
+agent-manager events [CURSOR]
+agent-manager pending
+agent-manager approve TICKET
+agent-manager approve-session TICKET
+agent-manager decline TICKET
+agent-manager cancel TICKET
+agent-manager answer TICKET TEXT|JSON
+agent-manager reconcile [--fix]
 agent-manager remove NAME|THREAD
 agent-manager ui
 ```
@@ -162,6 +177,55 @@ Defaults are `approval=on-request`, `sandbox=workspace-write`, and
 `danger-full-access` only in a trusted outer sandbox or a disposable
 environment.
 
+### Detached approvals
+
+The supervisor owns the upstream WebSocket used for `turn/start`, so approval,
+user-input, permissions, and MCP elicitation requests remain available after
+the invoking CLI exits. Inspect them with:
+
+```bash
+agent-manager pending
+agent-manager approve 0a1b2c3d4e5f
+agent-manager decline 0a1b2c3d4e5f
+agent-manager answer 0a1b2c3d4e5f "the answer"
+```
+
+For a single free-text user-input question, `answer` still accepts plain text.
+For several questions, pass a JSON object keyed by question ID; every value can
+be a string or an array of strings:
+
+```bash
+agent-manager answer 0a1b2c3d4e5f \
+  '{"environment":"staging","checks":["unit","integration"]}'
+```
+
+For MCP form elicitation, `answer` accepts a JSON object matching the requested
+schema. For example:
+
+```bash
+agent-manager answer 0a1b2c3d4e5f '{"environment":"staging"}'
+```
+
+The dashboard exposes the same workflow through **Pending requests**. It asks
+all user-input questions, supports secret and selectable answers, and renders
+typed MCP string, number, boolean, enum, and array fields. URL elicitations can
+be accepted, declined, or cancelled. `approve-session` grants an offered
+approval for the current Codex session; `cancel` remains distinct from a user
+decline.
+
+Each queue entry records its creation time, expiry, state, and an opaque
+`upstreamEpoch`. The default timeout is 24 hours; `autoResolutionMs` from Codex
+takes precedence. Expired requests are safely declined/cancelled and desktop
+notifications are shown through Notification Center on macOS or `notify-send`
+on Linux. When supervisor or App Server is replaced, retained entries become
+`stale` and remain visible for audit but cannot be answered on the wrong
+WebSocket connection.
+
+The queue and event log live under the manager state directory. A random
+capability token protects the local supervisor even though Funxy's WebSocket
+listener binds on all interfaces; the launcher accepts only a loopback control
+URL and stores the token with mode `0600`.
+
 `--skill SKILL` sends an explicit `$SKILL NAME` invocation to the new Codex
 thread. Agent Manager does not install or discover skills; they must already be
 available to Codex in the generated worktree or in a user-wide skill directory.
@@ -178,10 +242,27 @@ Git worktrees are lightweight: repository objects remain in the original
 repository and only checked-out files plus per-worktree Git metadata are added.
 Starting the same task again reuses its existing managed worktree.
 
+Threads created before version `0.5.0` keep their legacy
+`agent-manager:<task>` names and remain addressable by that full name or their
+thread ID.
+
 | Repository | `--workspace auto` behavior |
 | --- | --- |
 | Git | Dedicated branch and `git worktree` |
 | Non-Git directory | Current directory, one agent maximum |
+
+### Crash reconciliation
+
+`agent-manager reconcile` compares Codex threads, manager metadata, Git
+worktrees, and `agent-manager/*` branches. It reports missing worktrees,
+unowned workspaces, managed paths without metadata, unattached task branches,
+and worktrees created just before a process crash.
+
+`agent-manager reconcile --fix` only performs guarded repairs: an orphan
+worktree is removed only when the normal clean-and-integrated policy permits
+it, and an inactive thread whose directory disappeared is archived rather than
+deleted. Dirty worktrees and branches with unintegrated commits are preserved
+with an explanation.
 
 ## Server operations
 
@@ -195,10 +276,15 @@ agent-manager server-log
 ```
 
 The default endpoint is `ws://127.0.0.1:14551`. Override it with
-`AGENT_MANAGER_SERVER`. The default server listens on loopback only. Server
-status reports whether the endpoint belongs to a manager-owned process,
-systemd, or an external compatible service. Agent Manager never stops an
-external service.
+`AGENT_MANAGER_SERVER`. The supervisor listens at
+`ws://127.0.0.1:14552`; override that with `AGENT_MANAGER_CONTROL`. Both
+defaults use loopback URLs. Server status reports the upstream and supervisor
+separately and Agent Manager never stops an external service.
+
+The installed systemd/launchd supervisor restarts after an upstream failure and
+reconnects when App Server returns. The fallback process remains intentionally
+portable; run another Agent Manager command to restart it after a machine-level
+process kill.
 
 For example, to reuse another compatible local App Server:
 
@@ -215,16 +301,45 @@ make test
 
 `make check` validates the Bash launchers and loads the complete Funxy package.
 `make test` also exercises Git worktree creation, reuse, guarded removal,
-task-commit integration, and owned-versus-external server lifecycle behavior.
+task-commit integration, concurrent workspace/server creation,
+owned-versus-external server lifecycle behavior, App Server pagination,
+server-initiated request persistence/authentication/response, upstream-session
+replacement, request expiry, concurrent response races, rich form payloads,
+event cursors, reconciliation inventory, and failed-start rollback.
+
+The current compatibility baseline is Codex CLI `0.146.0` (live `self-test`)
+and Funxy `0.7.15` (complete test suite). CI installs the latest Funxy release.
+The App Server WebSocket API is experimental, so each new Codex version should
+be validated with `agent-manager self-test` before daily use.
 
 ## Source layout
 
 - `manager.lang` — flags and executable entrypoint;
 - `manager/` — App Server client, lifecycle operations, workspace policy, CLI,
   and TUI;
+- `supervisor.lang` — persistent authenticated App Server proxy and request
+  queue;
 - `agent-manager` — portable launcher and installer;
 - `workspace.sh` — Git worktree provider and deletion safeguards;
 - `tests/` — workspace integration tests.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines. This project
-is available under the [MIT License](LICENSE).
+is available under the [MIT License](LICENSE). Current reliability work is
+listed in [ROADMAP.md](ROADMAP.md).
+
+## Known limitations
+
+- The fallback `nohup` supervisor has no external restart monitor; systemd and
+  launchd installations do.
+- Funxy's current WebSocket server binds all interfaces. A loopback-only URL,
+  a random `0600` capability token, and request authentication protect normal
+  use, but a local unauthenticated client can still consume connection slots.
+- The event log is append-only and scanned by cursor; rotation and indexing are
+  not implemented yet.
+- The dashboard does not yet multiplex every active thread event in place;
+  `watch` and `events` expose the complete persisted stream.
+- Repository namespaces use the local absolute Git common-directory path, so
+  moving a repository changes the short namespace and separate clones remain
+  intentionally distinct.
+- Codex App Server WebSocket transport is experimental. The tested baseline is
+  listed above; run `agent-manager self-test` after upgrading Codex.

@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check shell syntax
-        run: bash -n agent-manager workspace.sh tests/workspace_test.sh tests/server_test.sh
+        run: bash -n agent-manager workspace.sh tests/workspace_test.sh tests/server_test.sh tests/app_server_test.sh tests/supervisor_test.sh tests/supervisor_reliability_test.sh tests/fake_workspace.sh
       - name: Test lifecycle helpers
         run: |
           ./tests/workspace_test.sh
@@ -32,4 +32,9 @@ jobs:
             https://raw.githubusercontent.com/funvibe/funxy/main/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Load and type-check the package
-        run: funxy manager.lang >/dev/null
+        run: |
+          funxy manager.lang >/dev/null
+          funxy tests/namespace_test.lang >/dev/null
+          ./tests/app_server_test.sh
+          ./tests/supervisor_test.sh
+          ./tests/supervisor_reliability_test.sh
